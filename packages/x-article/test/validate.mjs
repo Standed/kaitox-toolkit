@@ -5,8 +5,8 @@
  * 用法：npm test （会先 build 再跑）
  */
 import { markdownToContentState, collectImageSources, parseTweetId } from '../dist/contentState.js';
-import { sanitizeContentState } from '../dist/xArticleClient.js';
-import { deriveTitle } from '../dist/publishArticle.js';
+import { sanitizeContentState, XArticleClient } from '../dist/xArticleClient.js';
+import { deriveTitle, publishXArticle } from '../dist/publishArticle.js';
 
 const md = `# 主标题在此
 
@@ -47,6 +47,16 @@ let pass = 0,
 const check = (name, cond, extra = '') => {
   cond ? pass++ : fail++;
   console.log(`${cond ? '✅' : '❌'} ${name} ${extra}`);
+};
+
+const rejectsWith = async (name, action, pattern) => {
+  try {
+    await action();
+    check(name, false, '(did not reject)');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    check(name, pattern.test(message), `(got ${message})`);
+  }
 };
 
 const blocks = contentState.blocks;
@@ -219,6 +229,163 @@ const cover = makeCoverAsset(new Uint8Array([1, 2]), 'image/png', 'dir/hero.png'
 check(
   'makeCoverAsset：__cover__ 哨兵 + cover- 前缀 + 冲突避让',
   cover.src === '__cover__' && cover.key === 'cover' && cover.fileName === 'cover-hero-1.png' && cover.bytes.length === 2,
+);
+
+// --- strict four-step GraphQL client ---------------------------------------
+
+const QUERY_IDS = {
+  ArticleEntityDraftCreate: 'CREATE_QID',
+  ArticleEntityUpdateTitle: 'TITLE_QID',
+  ArticleEntityUpdateContent: 'CONTENT_QID',
+  ArticleEntityUpdateCoverMedia: 'COVER_QID',
+};
+
+const okJson = (value) => ({
+  ok: true,
+  status: 200,
+  async text() { return JSON.stringify(value); },
+  async json() { return value; },
+});
+
+const operationName = (url) => {
+  const match = String(url).match(/\/([^/]+)$/);
+  return match?.[1];
+};
+
+const makeGraphqlMock = (calls, responses = {}) => {
+  let mediaId = 0;
+  return async (url, init = {}) => {
+    calls.push({ url: String(url), ...init });
+    if (String(url).includes('command=INIT')) return okJson({ media_id_string: `MEDIA_${++mediaId}` });
+    if (String(url).includes('command=APPEND')) return okJson({});
+    if (String(url).includes('command=FINALIZE')) return okJson({});
+    const operation = operationName(url);
+    if (operation && operation in responses) return okJson(responses[operation]);
+    throw new Error(`unexpected request: ${url}`);
+  };
+};
+
+const successResponses = {
+  ArticleEntityDraftCreate: {
+    data: { articleentity_create_draft: { article_entity_results: { result: { rest_id: 'ART_777' } } } },
+  },
+  ArticleEntityUpdateTitle: { data: { articleentity_update_title: { success: true } } },
+  ArticleEntityUpdateContent: { data: { articleentity_update_content: { success: true } } },
+  ArticleEntityUpdateCoverMedia: { data: { articleentity_update_cover_media: { success: true } } },
+};
+
+const strictCalls = [];
+const strictResult = await publishXArticle({
+  markdown: '# 标题\n\n正文\n\n![图](body.png)\n',
+  credentials: { bearerToken: '', csrfToken: 'CT0' },
+  clientOptions: { fetchImpl: makeGraphqlMock(strictCalls, successResponses), queryIds: QUERY_IDS },
+  fetchImage: async () => ({ bytes: new Uint8Array([1]), mimeType: 'image/png' }),
+  fetchCover: async () => ({ bytes: new Uint8Array([2]), mimeType: 'image/png' }),
+});
+const graphCalls = strictCalls.filter((call) => call.url.includes('/i/api/graphql/'));
+check(
+  'GraphQL 四步顺序严格为 create → title → content → cover',
+  JSON.stringify(graphCalls.map((call) => operationName(call.url))) === JSON.stringify(Object.keys(QUERY_IDS)),
+  `(got ${graphCalls.map((call) => operationName(call.url)).join(', ')})`,
+);
+check('GraphQL 链路不调用 publish mutation', graphCalls.every((call) => !/publish/i.test(operationName(call.url))));
+check('strict publish 返回真实 restId', strictResult.restId === 'ART_777');
+check('strict publish 返回精确编辑链接', strictResult.editUrl === 'https://x.com/compose/articles/edit/ART_777');
+const createCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityDraftCreate');
+const titleCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityUpdateTitle');
+const contentCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityUpdateContent');
+check('create 是空白草稿', createCall && JSON.stringify(JSON.parse(createCall.body).variables) === '{}');
+check(
+  'title body 使用 articleEntityId + title',
+  titleCall && JSON.stringify(JSON.parse(titleCall.body).variables) === JSON.stringify({ articleEntityId: 'ART_777', title: '标题' }),
+);
+check(
+  'content body 使用 article_entity + content_state',
+  contentCall && JSON.parse(contentCall.body).variables.article_entity === 'ART_777' &&
+    JSON.parse(contentCall.body).variables.content_state.entity_map[0].value.data.media_items[0].media_id === 'MEDIA_1',
+);
+const titleIndex = strictCalls.indexOf(titleCall);
+const bodyUploadIndex = strictCalls.findIndex((call) => call.url.includes('command=INIT'));
+const contentIndex = strictCalls.indexOf(contentCall);
+check('title 成功后才上传正文图，正文图完成后再更新 content', titleIndex >= 0 && bodyUploadIndex > titleIndex && contentIndex > bodyUploadIndex);
+
+const graphqlErrorClient = new XArticleClient(
+  { bearerToken: '', csrfToken: 'CT0' },
+  {
+    queryIds: QUERY_IDS,
+    fetchImpl: makeGraphqlMock([], {
+      ArticleEntityUpdateTitle: { errors: [{ message: 'title failed' }] },
+    }),
+  },
+);
+await rejectsWith(
+  'HTTP 200 中的 GraphQL errors 仍会失败',
+  () => graphqlErrorClient.updateArticleTitle('ART_777', '标题'),
+  /GraphQL.*title failed/,
+);
+
+const httpErrorClient = new XArticleClient(
+  { bearerToken: '', csrfToken: 'CT0' },
+  {
+    queryIds: QUERY_IDS,
+    fetchImpl: async () => ({
+      ok: false,
+      status: 500,
+      async text() { return 'server failed'; },
+      async json() { return {}; },
+    }),
+  },
+);
+await rejectsWith(
+  'Article GraphQL HTTP 非 2xx 会失败',
+  () => httpErrorClient.updateArticleTitle('ART_777', '标题'),
+  /请求失败 500/,
+);
+
+await rejectsWith(
+  '缺少真实 rest_id 时终止',
+  () => publishXArticle({
+    markdown: '# 标题\n\n正文',
+    credentials: { bearerToken: '', csrfToken: 'CT0' },
+    clientOptions: {
+      queryIds: QUERY_IDS,
+      fetchImpl: makeGraphqlMock([], {
+        ...successResponses,
+        ArticleEntityDraftCreate: {
+          data: {
+            articleentity_create_draft: {
+              article_entity_results: {
+                result: { metadata: { author_results: { result: { rest_id: 'USER_123' } } } },
+              },
+            },
+          },
+        },
+      }),
+    },
+  }),
+  /X 未返回真实 rest_id/,
+);
+
+await rejectsWith(
+  '任一正文图失败会终止整篇草稿更新',
+  () => publishXArticle({
+    markdown: '# 标题\n\n![图](broken.png)',
+    credentials: { bearerToken: '', csrfToken: 'CT0' },
+    clientOptions: { queryIds: QUERY_IDS, fetchImpl: makeGraphqlMock([], successResponses) },
+    fetchImage: async () => { throw new Error('body image failed'); },
+  }),
+  /body image failed/,
+);
+
+await rejectsWith(
+  '封面下载或上传失败会终止',
+  () => publishXArticle({
+    markdown: '# 标题\n\n正文',
+    credentials: { bearerToken: '', csrfToken: 'CT0' },
+    clientOptions: { queryIds: QUERY_IDS, fetchImpl: makeGraphqlMock([], successResponses) },
+    fetchCover: async () => { throw new Error('cover failed'); },
+  }),
+  /cover failed/,
 );
 
 console.log(`\n== ${pass} passed, ${fail} failed ==`);

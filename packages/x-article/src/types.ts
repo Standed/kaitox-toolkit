@@ -147,8 +147,16 @@ export interface ContentState {
 }
 
 // ---------------------------------------------------------------------------
-// X GraphQL: ArticleEntityDraftCreate
+// X GraphQL: four-step article draft mutations
 // ---------------------------------------------------------------------------
+
+export type ArticleOperation =
+  | 'ArticleEntityDraftCreate'
+  | 'ArticleEntityUpdateTitle'
+  | 'ArticleEntityUpdateContent'
+  | 'ArticleEntityUpdateCoverMedia';
+
+export type ArticleQueryIds = Record<ArticleOperation, string>;
 
 /** ArticleEntityDraftCreate 用到的 feature flags（原样保留）。 */
 export interface ArticleFeatures {
@@ -166,12 +174,27 @@ export interface ArticleFieldToggles {
 }
 
 export interface ArticleDraftCreateBody {
+  variables: Record<string, never>;
+  features: ArticleFeatures;
+  fieldToggles: ArticleFieldToggles;
+  queryId: string;
+}
+
+export interface ArticleUpdateTitleBody {
   variables: {
-    content_state: ContentState;
+    articleEntityId: string;
     title: string;
   };
   features: ArticleFeatures;
-  fieldToggles: ArticleFieldToggles;
+  queryId: string;
+}
+
+export interface ArticleUpdateContentBody {
+  variables: {
+    article_entity: string;
+    content_state: ContentState;
+  };
+  features: ArticleFeatures;
   queryId: string;
 }
 

@@ -5,6 +5,7 @@
  *   - types.ts          data model (Draft.js content_state + X API)
  *   - contentState.ts   Markdown → content_state conversion (the core algorithm)
  *   - xArticleClient.ts HTTP + auth + media upload + draft creation
+ *   - graphql.ts        shared GraphQL application-error validation
  *   - publishArticle.ts end-to-end orchestration
  *   - styleCheck.ts     X-friendliness linter + plaintext fallback
  *   - pushHelpers.ts    shared push-side helpers (frontmatter, file names, cover asset)
@@ -31,6 +32,7 @@ export {
   DEFAULT_ARTICLE_FIELD_TOGGLES,
 } from './xArticleClient.js';
 export type { XArticleClientOptions, FetchLike } from './xArticleClient.js';
+export { assertGraphqlSuccess } from './graphql.js';
 export {
   publishXArticle,
   deriveTitle,

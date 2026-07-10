@@ -3,7 +3,7 @@
  *
  * 封装两件事：
  *   1. 媒体分片上传：INIT → APPEND → FINALIZE，拿到 media_id_string。
- *   2. 创建文章草稿：POST 到 GraphQL 的 ArticleEntityDraftCreate。
+ *   2. 严格四步文章草稿：创建空白草稿 → 标题 → 正文 → 封面。
  *
  * 鉴权本质：带着你在浏览器里登录 x.com 的会话（cookie + ct0 + 公开 bearer）替你调私有接口。
  * 所以它要么跑在 x.com 页面上下文里（扩展 content script，同源 fetch 自带 cookie），
@@ -16,12 +16,17 @@ import type {
   XCredentials,
   ArticleFeatures,
   ArticleFieldToggles,
+  ArticleOperation,
+  ArticleQueryIds,
   ArticleDraftCreateBody,
+  ArticleUpdateTitleBody,
+  ArticleUpdateContentBody,
   ArticleUpdateCoverMediaBody,
   MediaUploadInitResponse,
   UploadMediaCategory,
 } from './types';
 import { INLINE_STYLES } from './types.js';
+import { assertGraphqlSuccess } from './graphql.js';
 
 /** 所有 x.com 网页端共用的公开 bearer token（长期不变）。 */
 export const DEFAULT_BEARER_TOKEN =
@@ -90,10 +95,8 @@ export interface XArticleClientOptions {
    * 服务端调用时应传 'omit' 并在 credentials.cookie 里显式给出 cookie 串。
    */
   credentialsMode?: 'include' | 'omit' | 'same-origin';
-  /** 覆盖 ArticleEntityDraftCreate 的 queryId。 */
-  articleDraftCreateQueryId?: string;
-  /** 覆盖 ArticleEntityUpdateCoverMedia 的 queryId。 */
-  updateCoverMediaQueryId?: string;
+  /** 四个 Article mutation 的 queryId；X 会轮换，应由当前前端动态发现。 */
+  queryIds: ArticleQueryIds;
   features?: ArticleFeatures;
   fieldToggles?: ArticleFieldToggles;
   /** 覆盖设置封面时用的 features（默认 DEFAULT_COVER_MEDIA_FEATURES）。 */
@@ -103,23 +106,21 @@ export interface XArticleClientOptions {
 export class XArticleClient {
   private readonly fetchImpl: FetchLike;
   private readonly credentialsMode: 'include' | 'omit' | 'same-origin';
-  private readonly queryId: string;
-  private readonly coverQueryId: string;
+  private readonly queryIds: ArticleQueryIds;
   private readonly features: ArticleFeatures;
   private readonly fieldToggles: ArticleFieldToggles;
   private readonly coverFeatures: ArticleFeatures;
 
   constructor(
     private readonly credentials: XCredentials,
-    options: XArticleClientOptions = {},
+    options: XArticleClientOptions,
   ) {
     const globalFetch = (globalThis as any).fetch as FetchLike | undefined;
     const impl = options.fetchImpl ?? globalFetch;
     if (!impl) throw new Error('没有可用的 fetch，请通过 options.fetchImpl 注入。');
     this.fetchImpl = impl;
     this.credentialsMode = options.credentialsMode ?? 'include';
-    this.queryId = options.articleDraftCreateQueryId ?? ARTICLE_DRAFT_CREATE_QUERY_ID;
-    this.coverQueryId = options.updateCoverMediaQueryId ?? ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID;
+    this.queryIds = options.queryIds;
     this.features = options.features ?? DEFAULT_ARTICLE_FEATURES;
     this.fieldToggles = options.fieldToggles ?? DEFAULT_ARTICLE_FIELD_TOGGLES;
     this.coverFeatures = options.coverFeatures ?? DEFAULT_COVER_MEDIA_FEATURES;
@@ -207,45 +208,87 @@ export class XArticleClient {
     }
   }
 
-  // --- 创建文章草稿 ---------------------------------------------------------
+  // --- 四步文章草稿 ---------------------------------------------------------
 
   /**
-   * 创建 X Article 草稿。返回解析后的响应，并尽力抽出草稿的 rest_id。
-   * 注意：这一步只是「创建草稿」，正式发布是后续 publish 动作（见文档）。
+   * 创建空白 X Article 草稿。只从草稿 result 的精确路径取 rest_id，
+   * 避免把作者 User 对象的 rest_id 误当成草稿 id。
    */
-  async createArticleDraft(
-    title: string,
-    contentState: ContentState,
-  ): Promise<{ restId?: string; raw: any }> {
+  async createEmptyArticleDraft(): Promise<{ restId?: string; raw: any }> {
+    const operation: ArticleOperation = 'ArticleEntityDraftCreate';
+    const queryId = this.queryIdFor(operation);
     const body: ArticleDraftCreateBody = {
-      variables: { content_state: sanitizeContentState(contentState), title },
+      variables: {},
       features: this.features,
       fieldToggles: this.fieldToggles,
-      queryId: this.queryId,
+      queryId,
     };
-    const url = `${GRAPHQL_BASE}/${this.queryId}/ArticleEntityDraftCreate`;
+    const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
     const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
+    assertGraphqlSuccess(operation, raw);
     return { restId: extractRestId(raw), raw };
+  }
+
+  /** 给空白草稿设置标题。 */
+  async updateArticleTitle(articleEntityId: string, title: string): Promise<{ raw: any }> {
+    const operation: ArticleOperation = 'ArticleEntityUpdateTitle';
+    const queryId = this.queryIdFor(operation);
+    const body: ArticleUpdateTitleBody = {
+      variables: { articleEntityId, title },
+      features: this.features,
+      queryId,
+    };
+    const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
+    const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
+    assertGraphqlSuccess(operation, raw);
+    return { raw };
+  }
+
+  /** 在所有正文图都上传成功后设置 content_state。 */
+  async updateArticleContent(articleEntityId: string, contentState: ContentState): Promise<{ raw: any }> {
+    const operation: ArticleOperation = 'ArticleEntityUpdateContent';
+    const queryId = this.queryIdFor(operation);
+    const body: ArticleUpdateContentBody = {
+      variables: {
+        article_entity: articleEntityId,
+        content_state: sanitizeContentState(contentState),
+      },
+      features: this.features,
+      queryId,
+    };
+    const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
+    const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
+    assertGraphqlSuccess(operation, raw);
+    return { raw };
   }
 
   /**
    * 给已存在的文章草稿设置封面/头图。
    * 前置：mediaId 必须先经 uploadMedia(..., 'tweet_image') 上传得到；articleEntityId 是
-   * createArticleDraft 返回的 restId。这是**建草稿之后**的独立一步。
+   * createEmptyArticleDraft 返回的 restId。这是**建草稿之后**的独立一步。
    */
   async updateCoverMedia(articleEntityId: string, mediaId: string): Promise<{ raw: any }> {
+    const operation: ArticleOperation = 'ArticleEntityUpdateCoverMedia';
+    const queryId = this.queryIdFor(operation);
     const body: ArticleUpdateCoverMediaBody = {
       variables: {
         articleEntityId,
         coverMedia: { media_id: mediaId, media_category: 'DraftTweetImage' },
       },
       features: this.coverFeatures,
-      queryId: this.coverQueryId,
+      queryId,
       // 注意：此 mutation 不接受 fieldToggles，别加。
     };
-    const url = `${GRAPHQL_BASE}/${this.coverQueryId}/ArticleEntityUpdateCoverMedia`;
+    const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
     const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
+    assertGraphqlSuccess(operation, raw);
     return { raw };
+  }
+
+  private queryIdFor(operation: ArticleOperation): string {
+    const queryId = this.queryIds?.[operation];
+    if (!queryId) throw new Error(`缺少 ${operation} queryId。`);
+    return queryId;
   }
 
   // --- 底层请求 -------------------------------------------------------------
@@ -342,27 +385,6 @@ export function sanitizeContentState(cs: ContentState): ContentState {
  * 深搜顺序不稳定时会把用户 id 当草稿 id，跳转编辑页就会 404。
  */
 function extractRestId(raw: any): string | undefined {
-  try {
-    const result = raw?.data?.articleentity_create_draft?.article_entity_results?.result;
-    if (typeof result?.rest_id === 'string') return result.rest_id;
-    // 兜底 1：base64 的 id 形如 "ArticleEntity:<rest_id>"。
-    if (typeof result?.id === 'string' && typeof atob === 'function') {
-      const decoded = atob(result.id);
-      const m = /^ArticleEntity:(\d+)$/.exec(decoded);
-      if (m) return m[1];
-    }
-    // 兜底 2：结构变动时深度搜 rest_id，但跳过 User 对象（作者信息）。
-    const stack = [raw?.data];
-    while (stack.length) {
-      const node = stack.pop();
-      if (node && typeof node === 'object') {
-        if (node.__typename === 'User') continue;
-        if (typeof node.rest_id === 'string') return node.rest_id;
-        for (const v of Object.values(node)) if (v && typeof v === 'object') stack.push(v);
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-  return undefined;
+  const restId = raw?.data?.articleentity_create_draft?.article_entity_results?.result?.rest_id;
+  return typeof restId === 'string' && restId.trim() ? restId : undefined;
 }

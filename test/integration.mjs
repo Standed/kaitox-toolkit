@@ -126,8 +126,8 @@ try {
   const tokenCleared = await (await patchSetting({ token: null }, { 'x-kaitox-token': 'itest-token' })).json();
   check('PATCH /setting 清 token', tokenCleared.tokenConfigured === false);
 
-  // ---- 2. 上传流水线（含封面）----
-  console.log('\n[2] 插件上传流水线 + 封面');
+  // ---- 2. 严格四步草稿流水线（含封面）----
+  console.log('\n[2] 插件严格四步草稿流水线 + 封面');
   const draft = await client.getDraft(id);
   const calls = [];
   const ok = (obj) => ({ ok: true, status: 200, async text() { return JSON.stringify(obj); }, async json() { return obj; } });
@@ -140,15 +140,26 @@ try {
       const m = url.match(/[?&]media_id=([^&]+)/);
       return ok({ media_id_string: m ? m[1] : 'MID_x' });
     }
-    if (url.includes('/ArticleEntityDraftCreate')) return ok({ data: { article_entity_draft_create: { rest_id: 'ART_777' } } });
-    if (url.includes('/ArticleEntityUpdateCoverMedia')) return ok({ data: { articleentity_update_cover_media: { rest_id: 'ART_777' } } });
+    if (url.includes('/ArticleEntityDraftCreate')) return ok({ data: { articleentity_create_draft: { article_entity_results: { result: { rest_id: 'ART_777' } } } } });
+    if (url.includes('/ArticleEntityUpdateTitle')) return ok({ data: { articleentity_update_title: { success: true } } });
+    if (url.includes('/ArticleEntityUpdateContent')) return ok({ data: { articleentity_update_content: { success: true } } });
+    if (url.includes('/ArticleEntityUpdateCoverMedia')) return ok({ data: { articleentity_update_cover_media: { success: true } } });
     throw new Error('unexpected ' + url);
   };
   const progress = [];
   const result = await publishXArticle({
     markdown: draft.markdown, title: draft.title,
     credentials: { bearerToken: '', csrfToken: 'CT0' },
-    clientOptions: { fetchImpl: mockFetch, credentialsMode: 'include', articleDraftCreateQueryId: 'QID_1', updateCoverMediaQueryId: 'COVER_QID' },
+    clientOptions: {
+      fetchImpl: mockFetch,
+      credentialsMode: 'include',
+      queryIds: {
+        ArticleEntityDraftCreate: 'CREATE_QID',
+        ArticleEntityUpdateTitle: 'TITLE_QID',
+        ArticleEntityUpdateContent: 'CONTENT_QID',
+        ArticleEntityUpdateCoverMedia: 'COVER_QID',
+      },
+    },
     fetchImage: async (src) => {
       const a = draft.assets.find((x) => x.src === src);
       return { bytes: await client.getAsset(draft.id, a.fileName), mimeType: a.mime };
@@ -156,7 +167,7 @@ try {
     fetchCover: async () => ({ bytes: await client.getAsset(draft.id, draft.cover.fileName), mimeType: draft.cover.mime }),
     onProgress: (p) => progress.push(p),
   });
-  // 进度回调：images 按完成数推进，draft/cover 在进入阶段时各推一次，顺序与流水线一致
+  // 进度回调：先建空白 draft，再上传 images，最后处理 cover。
   check(
     '进度回调：images 0/1 → 1/1',
     progress.some((p) => p.stage === 'images' && p.done === 0 && p.total === 1) &&
@@ -164,19 +175,25 @@ try {
   );
   const stageIdx = (s) => progress.findIndex((p) => p.stage === s);
   check(
-    '进度回调：images → draft → cover 顺序',
-    stageIdx('draft') > progress.map((p) => p.stage).lastIndexOf('images') && stageIdx('cover') > stageIdx('draft'),
+    '进度回调：draft → images → cover 顺序',
+    stageIdx('draft') >= 0 && stageIdx('draft') < stageIdx('images') && stageIdx('cover') > progress.map((p) => p.stage).lastIndexOf('images'),
   );
   const init = calls.find((c) => c.url.includes('command=INIT'));
   check('INIT media_category=tweet_image', init.url.includes('media_category=tweet_image'));
   const create = calls.find((c) => c.url.includes('/ArticleEntityDraftCreate'));
-  check('create 用了 queryId', create.url.includes('QID_1'));
+  check('create 用了 queryId', create.url.includes('CREATE_QID'));
   check('create credentials=include', create.credentials === 'include');
   check('create 无手动 cookie 头', !('cookie' in create.headers));
-  const cs = JSON.parse(create.body).variables.content_state;
+  check('create 只建空白草稿', JSON.stringify(JSON.parse(create.body).variables) === '{}');
+  const titleCall = calls.find((c) => c.url.includes('/ArticleEntityUpdateTitle'));
+  check('title mutation 用了 TITLE_QID', titleCall?.url.includes('TITLE_QID'));
+  check('title mutation 传 articleEntityId + title', titleCall && JSON.stringify(JSON.parse(titleCall.body).variables) === JSON.stringify({ articleEntityId: 'ART_777', title: '集成测试' }));
+  const contentCall = calls.find((c) => c.url.includes('/ArticleEntityUpdateContent'));
+  check('content mutation 用了 CONTENT_QID', contentCall?.url.includes('CONTENT_QID'));
+  const cs = contentCall ? JSON.parse(contentCall.body).variables.content_state : { entity_map: [] };
   const media = cs.entity_map.find((e) => e.value.type === 'MEDIA');
-  check('MEDIA.media_id=正文图上传值', media.value.data.media_items[0].media_id === 'MID_1');
-  check('MEDIA.category=DraftTweetImage', media.value.data.media_items[0].media_category === 'DraftTweetImage');
+  check('MEDIA.media_id=正文图上传值', media?.value.data.media_items[0].media_id === 'MID_1');
+  check('MEDIA.category=DraftTweetImage', media?.value.data.media_items[0].media_category === 'DraftTweetImage');
   check('restId 解析', result.restId === 'ART_777');
 
   // 封面：上传发生在建草稿之后，且用独立的 UpdateCoverMedia mutation
@@ -190,10 +207,22 @@ try {
   check('cover.media_category=DraftTweetImage', coverBody.variables.coverMedia.media_category === 'DraftTweetImage');
   check('cover 无 fieldToggles', !('fieldToggles' in coverBody));
   check('cover 用封面专属 features', coverBody.features.profile_label_improvements_pcf_label_in_post_enabled === DEFAULT_COVER_MEDIA_FEATURES.profile_label_improvements_pcf_label_in_post_enabled && DEFAULT_COVER_MEDIA_FEATURES.profile_label_improvements_pcf_label_in_post_enabled === true);
-  // 建草稿 → 设封面的先后顺序
-  const idxCreate = calls.findIndex((c) => c.url.includes('/ArticleEntityDraftCreate'));
-  const idxCover = calls.findIndex((c) => c.url.includes('/ArticleEntityUpdateCoverMedia'));
-  check('先建草稿再设封面', idxCreate >= 0 && idxCover > idxCreate);
+  // 四个 GraphQL mutation 必须精确有序，不得调用发布 mutation。
+  const graphqlOperations = calls
+    .filter((c) => c.url.includes('/i/api/graphql/'))
+    .map((c) => c.url.split('/').pop());
+  check(
+    'GraphQL 顺序=create → title → content → cover',
+    JSON.stringify(graphqlOperations) === JSON.stringify([
+      'ArticleEntityDraftCreate',
+      'ArticleEntityUpdateTitle',
+      'ArticleEntityUpdateContent',
+      'ArticleEntityUpdateCoverMedia',
+    ]),
+    `(got ${graphqlOperations.join(', ')})`,
+  );
+  check('全程 draft-only，无 publish mutation', graphqlOperations.every((name) => !/publish/i.test(name)));
+  check('返回精确编辑链接', result.editUrl === 'https://x.com/compose/articles/edit/ART_777');
 
   // 重试必须清掉旧错误；done 必须持久化可核验的账号与精确编辑地址。
   await client.ack(id, { status: 'failed', error: 'stale upload failure' });
