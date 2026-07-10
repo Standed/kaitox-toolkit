@@ -1,7 +1,10 @@
 import {
   CONTENT_OS_INBOUND_SOURCE,
   CONTENT_OS_ORIGIN,
+  ContentOsBridgeError,
+  contentOsPublicError,
   parseContentOsPageRequest,
+  parseContentOsPublicError,
   type ContentOsPageRequest,
   type ContentOsRuntimeResponse,
 } from './content-os-protocol.js';
@@ -21,16 +24,12 @@ export interface ContentOsPageMessageDependencies {
   sendRuntimeMessage(message: ContentOsPageRequest): Promise<unknown>;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Kaitox 请求失败';
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function invalidResponse(): { error: string } {
-  return { error: 'Kaitox 返回了无效响应' };
+function invalidResponse(): ContentOsRuntimeResponse {
+  return { error: contentOsPublicError(new ContentOsBridgeError('INVALID_RESPONSE')) };
 }
 
 export function normalizeContentOsRuntimeResponse(
@@ -38,7 +37,10 @@ export function normalizeContentOsRuntimeResponse(
   value: unknown,
 ): ContentOsRuntimeResponse {
   if (!isRecord(value)) return invalidResponse();
-  if (typeof value.error === 'string' && value.error.trim()) return { error: value.error };
+  if (value.status === undefined && value.error !== undefined) {
+    const error = parseContentOsPublicError(value.error);
+    return error ? { error } : invalidResponse();
+  }
 
   if (requestType === 'KAITOX_PING') {
     return value.available === true && value.draftOnly === true
@@ -53,20 +55,19 @@ export function normalizeContentOsRuntimeResponse(
 
   const status = value.status;
   if (!['pending', 'uploading', 'done', 'failed'].includes(String(status))) {
-    return { error: 'Kaitox 返回了无效草稿状态' };
+    return invalidResponse();
   }
   if (status === 'done') {
     if (typeof value.restId !== 'string'
       || !value.restId.trim()
       || value.editUrl !== `https://x.com/compose/articles/edit/${value.restId}`) {
-      return { error: 'Kaitox 返回了无效草稿状态' };
+      return invalidResponse();
     }
     return { status: 'done', restId: value.restId, editUrl: value.editUrl };
   }
   if (status === 'failed') {
-    return typeof value.error === 'string' && value.error.trim()
-      ? { status: 'failed', error: value.error }
-      : { status: 'failed' };
+    const error = parseContentOsPublicError(value.error);
+    return error ? { status: 'failed', error } : invalidResponse();
   }
   return { status } as ContentOsRuntimeResponse;
 }
@@ -86,7 +87,7 @@ export async function handleContentOsPageMessage(
       await dependencies.sendRuntimeMessage(request),
     );
   } catch (error) {
-    response = { error: errorMessage(error) };
+    response = { error: contentOsPublicError(error) };
   }
   dependencies.pageWindow.postMessage({
     source: CONTENT_OS_INBOUND_SOURCE,

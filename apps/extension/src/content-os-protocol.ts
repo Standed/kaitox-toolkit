@@ -3,12 +3,53 @@ import { collectImageSources } from '@kaitox/x-article';
 export const CONTENT_OS_ORIGIN = 'https://aizao.ai';
 export const CONTENT_OS_OUTBOUND_SOURCE = 'xiyangshi-content-os';
 export const CONTENT_OS_INBOUND_SOURCE = 'xiyangshi-kaitox';
-export const CONTENT_OS_TARGET_HANDLE = 'aaxiaoshi666';
+export const CONTENT_OS_TARGET_HANDLE = '@aaxiaoshi666';
 export const MAX_HANDOFF_MEDIA = 25;
 export const MAX_HANDOFF_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_HANDOFF_TOTAL_BYTES = 64 * 1024 * 1024;
+export const MAX_HANDOFF_TTL_MS = 60 * 60 * 1000;
+export const MAX_HANDOFF_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
 const ALLOWED_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const HANDOFF_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export const CONTENT_OS_PUBLIC_ERROR_MESSAGES = {
+  INVALID_HANDOFF: '交接包未通过安全校验，请重新导出后再试。',
+  HANDOFF_REPLAY_CONFLICT: '该交接任务与已接收的内容不一致。',
+  MEDIA_DOWNLOAD_FAILED: '图片下载失败，请检查素材后重试。',
+  MEDIA_VALIDATION_FAILED: '图片校验失败，请重新导出素材。',
+  RELAY_UNAVAILABLE: '本地 Kaitox 服务暂不可用。',
+  STATUS_MISMATCH: '草稿状态与交接任务不匹配。',
+  DRAFT_FAILED: 'X 草稿创建失败，请在 Kaitox 中检查后重试。',
+  INVALID_RESPONSE: 'Kaitox 返回了无效响应。',
+  INTERNAL_ERROR: 'Kaitox 暂时无法处理该请求，请稍后重试。',
+} as const;
+
+export type ContentOsPublicErrorCode = keyof typeof CONTENT_OS_PUBLIC_ERROR_MESSAGES;
+export interface ContentOsPublicError {
+  code: ContentOsPublicErrorCode;
+  message: string;
+}
+
+export class ContentOsBridgeError extends Error {
+  constructor(readonly code: ContentOsPublicErrorCode) {
+    super(CONTENT_OS_PUBLIC_ERROR_MESSAGES[code]);
+    this.name = 'ContentOsBridgeError';
+  }
+}
+
+export function contentOsPublicError(error: unknown): ContentOsPublicError {
+  const code = error instanceof ContentOsBridgeError ? error.code : 'INTERNAL_ERROR';
+  return { code, message: CONTENT_OS_PUBLIC_ERROR_MESSAGES[code] };
+}
+
+export function parseContentOsPublicError(value: unknown): ContentOsPublicError | undefined {
+  if (!isRecord(value) || typeof value.code !== 'string') return undefined;
+  if (!(value.code in CONTENT_OS_PUBLIC_ERROR_MESSAGES)) return undefined;
+  const code = value.code as ContentOsPublicErrorCode;
+  return { code, message: CONTENT_OS_PUBLIC_ERROR_MESSAGES[code] };
+}
 
 export interface XArticleHandoffAsset {
   key: string;
@@ -53,20 +94,19 @@ export type ContentOsPageRequest =
       requestId: string;
       type: 'KAITOX_STATUS';
       draftId: string;
+      handoffId: string;
     };
 
-export type KaitoxDraftStatus = {
-  status: 'pending' | 'uploading' | 'done' | 'failed';
-  restId?: string;
-  editUrl?: string;
-  error?: string;
-};
+export type KaitoxDraftStatus =
+  | { status: 'pending' | 'uploading' }
+  | { status: 'done'; restId: string; editUrl: string }
+  | { status: 'failed'; error: ContentOsPublicError };
 
 export type ContentOsRuntimeResponse =
   | { available: true; draftOnly: true }
   | { draftId: string }
   | KaitoxDraftStatus
-  | { error: string };
+  | { error: ContentOsPublicError };
 
 export type HandoffValidationResult =
   | { ok: true; manifest: XArticleHandoffManifest }
@@ -100,7 +140,8 @@ export function parseContentOsPageRequest(value: unknown): ContentOsPageRequest 
     };
   }
   if (value.type === 'KAITOX_STATUS' && isNonEmptyString(value.draftId)) {
-    return { ...base, type: 'KAITOX_STATUS', draftId: value.draftId };
+    if (typeof value.handoffId !== 'string' || !HANDOFF_ID_PATTERN.test(value.handoffId)) return undefined;
+    return { ...base, type: 'KAITOX_STATUS', draftId: value.draftId, handoffId: value.handoffId };
   }
   return undefined;
 }
@@ -195,7 +236,9 @@ export function validateHandoff(
   if (!isRecord(value)) return { ok: false, issues: ['$ must be an object'] };
 
   if (value.schemaVersion !== 1) issues.push('$.schemaVersion must equal 1');
-  if (!isNonEmptyString(value.handoffId)) issues.push('$.handoffId must be a non-empty string');
+  if (typeof value.handoffId !== 'string' || !HANDOFF_ID_PATTERN.test(value.handoffId)) {
+    issues.push('$.handoffId must be 1-128 safe identifier characters');
+  }
   if (!isNonEmptyString(value.title)) issues.push('$.title must be a non-empty string');
   if (!isNonEmptyString(value.markdown)) issues.push('$.markdown must be a non-empty string');
   if (value.targetHandle !== CONTENT_OS_TARGET_HANDLE) {
@@ -219,6 +262,16 @@ export function validateHandoff(
 
   if (value.cover !== undefined) validateAsset(value.cover, '$.cover', issues);
 
+  const declaredTotalBytes = [
+    ...(Array.isArray(assets) ? assets : []),
+    ...(value.cover === undefined ? [] : [value.cover]),
+  ].reduce((total, asset) => (
+    total + (isRecord(asset) && Number.isInteger(asset.bytesLen) ? Number(asset.bytesLen) : 0)
+  ), 0);
+  if (declaredTotalBytes > MAX_HANDOFF_TOTAL_BYTES) {
+    issues.push(`declared asset bytes must not exceed ${MAX_HANDOFF_TOTAL_BYTES}`);
+  }
+
   const fileNames = [
     ...(Array.isArray(assets) ? assets.map((asset) => isRecord(asset) ? asset.fileName : undefined) : []),
     isRecord(value.cover) ? value.cover.fileName : undefined,
@@ -227,12 +280,21 @@ export function validateHandoff(
 
   const createdAt = typeof value.createdAt === 'string' ? Date.parse(value.createdAt) : Number.NaN;
   const expiresAt = typeof value.expiresAt === 'string' ? Date.parse(value.expiresAt) : Number.NaN;
+  const now = (options.now ?? Date.now)();
   if (!Number.isFinite(createdAt)) issues.push('$.createdAt must be an ISO date');
   if (!Number.isFinite(expiresAt)) issues.push('$.expiresAt must be an ISO date');
   if (Number.isFinite(createdAt) && Number.isFinite(expiresAt) && expiresAt <= createdAt) {
     issues.push('$.expiresAt must be after $.createdAt');
   }
-  if (Number.isFinite(expiresAt) && expiresAt <= (options.now ?? Date.now)()) {
+  if (Number.isFinite(createdAt) && createdAt > now + MAX_HANDOFF_FUTURE_SKEW_MS) {
+    issues.push('$.createdAt is too far in the future');
+  }
+  if (Number.isFinite(createdAt)
+    && Number.isFinite(expiresAt)
+    && expiresAt - createdAt > MAX_HANDOFF_TTL_MS) {
+    issues.push('handoff TTL exceeds the maximum');
+  }
+  if (Number.isFinite(expiresAt) && expiresAt <= now) {
     issues.push('$.expiresAt has expired');
   }
 

@@ -72,8 +72,13 @@ const {
   CONTENT_OS_ORIGIN,
   CONTENT_OS_INBOUND_SOURCE,
   CONTENT_OS_OUTBOUND_SOURCE,
+  CONTENT_OS_TARGET_HANDLE,
+  MAX_HANDOFF_FUTURE_SKEW_MS,
   MAX_HANDOFF_IMAGE_BYTES,
   MAX_HANDOFF_MEDIA,
+  MAX_HANDOFF_TOTAL_BYTES,
+  MAX_HANDOFF_TTL_MS,
+  contentOsPublicError,
   validateHandoff,
 } = await import(contentOsProtocolModuleUrl);
 
@@ -148,7 +153,7 @@ const allQueryIds = (prefix) => ({
 // ---- -1. Content OS handoff protocol ----
 console.log('\n[-1] Content OS handoff protocol validation');
 const handoffNow = Date.parse('2026-07-10T04:00:00.000Z');
-const handoffBytes = Uint8Array.from([1, 2, 3, 4]);
+const handoffBytes = pngBytes;
 const handoffSha = createHash('sha256').update(handoffBytes).digest('hex');
 const makeHandoffAsset = (index, overrides = {}) => ({
   key: `x-article-media/media-${index}.png`,
@@ -166,7 +171,7 @@ const validHandoff = {
   handoffId: 'handoff-task-6',
   title: 'Task 6 bridge',
   markdown: validHandoffAssets.map((asset, index) => `![image ${index + 1}](${asset.src})`).join('\n\n'),
-  targetHandle: 'aaxiaoshi666',
+  targetHandle: '@aaxiaoshi666',
   assets: validHandoffAssets,
   cover: makeHandoffAsset('cover', {
     key: 'x-article-cover/cover-5x2.png',
@@ -187,6 +192,7 @@ const handoffOk = (manifest) => validateHandoff(manifest, { now: () => handoffNo
 check('Content OS exact origin constant is locked', CONTENT_OS_ORIGIN === 'https://aizao.ai');
 check('valid Content OS handoff passes', handoffOk(validHandoff));
 check('wrong target handle is rejected', !handoffOk({ ...validHandoff, targetHandle: 'other' }));
+check('the Content OS account is locked to @aaxiaoshi666', CONTENT_OS_TARGET_HANDLE === '@aaxiaoshi666');
 check('more than 25 body media are rejected', MAX_HANDOFF_MEDIA === 25 && !handoffOk({
   ...validHandoff,
   assets: makeHandoffAssets(26),
@@ -204,6 +210,31 @@ check('non-allowlisted media host is rejected', !handoffOk({
   mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
 }));
 check('expired manifest is rejected', !handoffOk({ ...validHandoff, expiresAt: '2026-07-09T00:00:00.000Z' }));
+check('handoff TTL cannot exceed the fixed maximum', MAX_HANDOFF_TTL_MS === 60 * 60 * 1000 && !handoffOk({
+  ...validHandoff,
+  expiresAt: new Date(Date.parse(validHandoff.createdAt) + MAX_HANDOFF_TTL_MS + 1).toISOString(),
+}));
+check('createdAt cannot be too far in the future', MAX_HANDOFF_FUTURE_SKEW_MS === 5 * 60 * 1000 && !handoffOk({
+  ...validHandoff,
+  createdAt: new Date(handoffNow + MAX_HANDOFF_FUTURE_SKEW_MS + 1).toISOString(),
+  expiresAt: new Date(handoffNow + MAX_HANDOFF_FUTURE_SKEW_MS + 60_000).toISOString(),
+}));
+const oversizedAggregateAssets = makeHandoffAssets(17).map((asset) => ({
+  ...asset,
+  bytesLen: 4 * 1024 * 1024,
+}));
+check('declared body and cover bytes cannot exceed the aggregate cap', MAX_HANDOFF_TOTAL_BYTES === 64 * 1024 * 1024 && !handoffOk({
+  ...validHandoff,
+  assets: oversizedAggregateAssets,
+  cover: undefined,
+  markdown: oversizedAggregateAssets.map((asset) => `![](${asset.src})`).join('\n'),
+  mediaMap: oversizedAggregateAssets.map((_, assetIndex) => ({
+    assetIndex,
+    figureIds: [`figure-${assetIndex + 1}`],
+    sourceIndexes: [assetIndex],
+    cellLabels: [],
+  })),
+}));
 check('Markdown image order must exactly match assets', !handoffOk({
   ...validHandoff,
   markdown: [...validHandoffAssets].reverse().map((asset) => `![](${asset.src})`).join('\n'),
@@ -242,6 +273,13 @@ const pingRequest = {
   requestId: 'request-ping-1',
   type: 'KAITOX_PING',
   xCredentials: { cookie: 'must-not-cross-extension-boundary' },
+};
+const statusRequest = {
+  source: CONTENT_OS_OUTBOUND_SOURCE,
+  requestId: 'request-status-1',
+  type: 'KAITOX_STATUS',
+  draftId: 'draft-content-os-1',
+  handoffId: validHandoff.handoffId,
 };
 await handleContentOsPageMessage({
   source: pageWindow,
@@ -289,7 +327,22 @@ check('malformed done status is rejected by the page bridge',
     status: 'done',
     restId: 'rest-1',
     editUrl: 'https://x.com/compose/articles/edit/other',
-  }).error === 'Kaitox 返回了无效草稿状态');
+  }).error.code === 'INVALID_RESPONSE');
+const redactedPublicError = normalizeContentOsRuntimeResponse('KAITOX_STATUS', {
+  error: { code: 'INTERNAL_ERROR', message: 'secret /Users/person token=abc' },
+});
+check('page errors are bounded code/message pairs with untrusted details removed',
+  redactedPublicError.error.code === 'INTERNAL_ERROR' &&
+  redactedPublicError.error.message.length <= 120 &&
+  !JSON.stringify(redactedPublicError).includes('/Users/person') &&
+  !JSON.stringify(redactedPublicError).includes('token=abc'));
+check('raw string errors are never forwarded to the page',
+  normalizeContentOsRuntimeResponse('KAITOX_STATUS', { error: 'relay /Users/person token=abc' }).error.code === 'INVALID_RESPONSE');
+check('unknown internal exceptions map to one fixed public error',
+  JSON.stringify(contentOsPublicError(new Error('relay /Users/person token=abc'))) === JSON.stringify({
+    code: 'INTERNAL_ERROR',
+    message: 'Kaitox 暂时无法处理该请求，请稍后重试。',
+  }));
 
 const backgroundAssets = makeHandoffAssets(4);
 const backgroundManifest = {
@@ -322,6 +375,10 @@ const backgroundClient = {
       restId: 'rest-content-os-1',
       editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
       targetHandle: '@aaxiaoshi666',
+      sourceMeta: {
+        handoffId: validHandoff.handoffId,
+        targetHandle: '@aaxiaoshi666',
+      },
       markdown: 'secret body must not cross status',
     };
   },
@@ -335,10 +392,21 @@ const backgroundDeps = {
     maxActiveHandoffDownloads = Math.max(maxActiveHandoffDownloads, activeHandoffDownloads);
     await new Promise((resolve) => setTimeout(resolve, 5));
     activeHandoffDownloads--;
-    return new Response(handoffBytes, { status: 200, headers: { 'content-type': 'image/png' } });
+    return new Response(handoffBytes, {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(handoffBytes.byteLength),
+      },
+    });
   },
   storageLocal: {
-    async set(value) { storedAutoUpload.push(value); },
+    values: {},
+    async get(key) { return { [key]: this.values[key] }; },
+    async set(value) {
+      Object.assign(this.values, value);
+      storedAutoUpload.push(value);
+    },
   },
   tabs: {
     async create(value) { openedTabs.push(value); },
@@ -363,13 +431,79 @@ check('auto-upload id is stored before opening only the X Articles composer',
   storedAutoUpload[0]?.kaitoxAutoUploadDraftId === 'draft-content-os-1' &&
   openedTabs.length === 1 && openedTabs[0].url === 'https://x.com/compose/articles');
 
-const safeStatus = await contentOsDraftStatus('draft-content-os-1', backgroundDeps);
+const replayResult = await enqueueContentOsHandoff(backgroundManifest, backgroundDeps);
+check('replaying the same handoffId is idempotent and creates no duplicate draft or tab',
+  replayResult.draftId === enqueueResult.draftId && postDraftInputs.length === 1 && openedTabs.length === 1);
+await assert.rejects(
+  () => enqueueContentOsHandoff({ ...backgroundManifest, title: 'conflicting replay' }, backgroundDeps),
+  (error) => error?.code === 'HANDOFF_REPLAY_CONFLICT',
+);
+check('the same handoffId cannot be replayed with different content', postDraftInputs.length === 1);
+
+let corruptedReplayPostCount = 0;
+await assert.rejects(
+  () => enqueueContentOsHandoff({ ...backgroundManifest, handoffId: 'handoff-corrupt-record' }, {
+    ...backgroundDeps,
+    storageLocal: {
+      async get(key) { return { [key]: { version: 1, handoffId: 'tampered' } }; },
+      async set() {},
+    },
+    getClient: async () => ({
+      async postDraft() { corruptedReplayPostCount++; return { id: 'must-not-exist' }; },
+    }),
+  }),
+  (error) => error?.code === 'HANDOFF_REPLAY_CONFLICT',
+);
+check('a corrupt persisted replay record fails closed before relay enqueue', corruptedReplayPostCount === 0);
+
+let concurrentPostCount = 0;
+const concurrentStorage = {
+  values: {},
+  async get(key) { return { [key]: this.values[key] }; },
+  async set(value) { Object.assign(this.values, value); },
+};
+const concurrentDeps = {
+  ...backgroundDeps,
+  storageLocal: concurrentStorage,
+  getClient: async () => ({
+    async postDraft() {
+      concurrentPostCount++;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { id: 'draft-concurrent' };
+    },
+  }),
+};
+const concurrentManifest = { ...backgroundManifest, handoffId: 'handoff-concurrent' };
+const concurrentResults = await Promise.all([
+  enqueueContentOsHandoff(concurrentManifest, concurrentDeps),
+  enqueueContentOsHandoff(concurrentManifest, concurrentDeps),
+]);
+check('concurrent duplicate handoffs share one relay enqueue',
+  concurrentPostCount === 1 && concurrentResults.every(({ draftId }) => draftId === 'draft-concurrent'));
+
+const safeStatus = await contentOsDraftStatus('draft-content-os-1', validHandoff.handoffId, backgroundDeps);
 check('status response is strict and omits body/account/credential-adjacent fields',
   JSON.stringify(safeStatus) === JSON.stringify({
     status: 'done',
     restId: 'rest-content-os-1',
     editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
   }));
+let wrongTerminalRejected = false;
+await assert.rejects(
+  () => contentOsDraftStatus('draft-content-os-1', 'wrong-handoff', backgroundDeps),
+  (error) => error?.code === 'STATUS_MISMATCH',
+);
+await assert.rejects(
+  () => contentOsDraftStatus('draft-content-os-1', validHandoff.handoffId, {
+    ...backgroundDeps,
+    getClient: async () => ({
+      ...backgroundClient,
+      async getDraft(id) { return { ...(await backgroundClient.getDraft(id)), targetHandle: '@other' }; },
+    }),
+  }),
+  (error) => (wrongTerminalRejected = error?.code === 'STATUS_MISMATCH'),
+);
+check('status lookup correlates handoffId and the terminal @aaxiaoshi666 handle', wrongTerminalRejected);
 check('background rejects runtime messages from non-Content-OS senders',
   await handleContentOsRuntimeMessage(pingRequest, { url: 'https://evil.example/writing' }, backgroundDeps) === undefined);
 check('background ping is draft-only and credential-free',
@@ -378,24 +512,164 @@ check('background ping is draft-only and credential-free',
     { url: 'https://aizao.ai/writing/123' },
     backgroundDeps,
   )) === JSON.stringify({ available: true, draftOnly: true }));
+check('status page requests must carry the handoffId correlation key',
+  JSON.stringify(await handleContentOsRuntimeMessage(
+    statusRequest,
+    { url: 'https://aizao.ai/writing/123' },
+    backgroundDeps,
+  )) === JSON.stringify(safeStatus) &&
+  await handleContentOsRuntimeMessage(
+    { ...statusRequest, handoffId: undefined },
+    { url: 'https://aizao.ai/writing/123' },
+    backgroundDeps,
+  ) === undefined);
 
 let integrityPostCount = 0;
+let contentTypeRejected = false;
 await assert.rejects(
   () => enqueueContentOsHandoff({
     ...validHandoff,
+    handoffId: 'handoff-integrity',
     assets: [{ ...validHandoff.assets[0], sha256: '0'.repeat(64) }],
     markdown: `![](${validHandoff.assets[0].src})`,
     mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
     cover: undefined,
   }, {
     ...backgroundDeps,
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
     getClient: async () => ({
       async postDraft() { integrityPostCount++; return { id: 'must-not-exist' }; },
     }),
   }),
-  /图片哈希校验失败/,
+  (error) => error?.code === 'MEDIA_VALIDATION_FAILED',
 );
 check('integrity failure prevents relay enqueue', integrityPostCount === 0);
+
+const singleAssetHandoff = {
+  ...validHandoff,
+  assets: [validHandoff.assets[0]],
+  cover: undefined,
+  markdown: `![](${validHandoff.assets[0].src})`,
+  mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
+};
+let preflightReadCount = 0;
+await assert.rejects(
+  () => enqueueContentOsHandoff(singleAssetHandoff, {
+    ...backgroundDeps,
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      url: validHandoff.assets[0].src,
+      headers: new Headers({
+        'content-type': 'image/png',
+        'content-length': String(MAX_HANDOFF_IMAGE_BYTES),
+      }),
+      body: { getReader() { preflightReadCount++; throw new Error('body must not be read'); } },
+      async arrayBuffer() { throw new Error('arrayBuffer must not be called'); },
+    }),
+  }),
+  (error) => error?.code === 'MEDIA_VALIDATION_FAILED',
+);
+check('Content-Length is rejected before reading or allocating an oversized body', preflightReadCount === 0);
+
+let arrayBufferCalled = false;
+let streamReadCount = 0;
+await assert.rejects(
+  () => enqueueContentOsHandoff(singleAssetHandoff, {
+    ...backgroundDeps,
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
+    fetchImpl: async () => {
+      const chunks = [new Uint8Array(MAX_HANDOFF_IMAGE_BYTES), new Uint8Array([1])];
+      return {
+        ok: true,
+        status: 200,
+        url: validHandoff.assets[0].src,
+        headers: new Headers({ 'content-type': 'image/png' }),
+        body: {
+          getReader() {
+            return {
+              async read() {
+                streamReadCount++;
+                return chunks.length ? { done: false, value: chunks.shift() } : { done: true };
+              },
+            };
+          },
+        },
+        async arrayBuffer() { arrayBufferCalled = true; throw new Error('must stream'); },
+      };
+    },
+  }),
+  (error) => error?.code === 'MEDIA_VALIDATION_FAILED',
+);
+check('streaming cap aborts before a whole response allocation', streamReadCount === 1 && !arrayBufferCalled);
+
+await assert.rejects(
+  () => enqueueContentOsHandoff(singleAssetHandoff, {
+    ...backgroundDeps,
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
+    fetchImpl: async () => new Response(handoffBytes, {
+      status: 200,
+      headers: {
+        'content-type': 'text/html',
+        'content-length': String(handoffBytes.byteLength),
+      },
+    }),
+  }),
+  (error) => (contentTypeRejected = error?.code === 'MEDIA_VALIDATION_FAILED'),
+);
+check('downloaded Content-Type must match the manifest image MIME', contentTypeRejected);
+
+const fakePngBytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xdb, 0, 1, 2, 3]);
+const fakePngAsset = {
+  ...validHandoff.assets[0],
+  bytesLen: fakePngBytes.byteLength,
+  sha256: createHash('sha256').update(fakePngBytes).digest('hex'),
+};
+let signatureRejected = false;
+await assert.rejects(
+  () => enqueueContentOsHandoff({
+    ...validHandoff,
+    assets: [fakePngAsset],
+    cover: undefined,
+    markdown: `![](${fakePngAsset.src})`,
+    mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
+  }, {
+    ...backgroundDeps,
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
+    fetchImpl: async () => new Response(fakePngBytes, {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(fakePngBytes.byteLength),
+      },
+    }),
+  }),
+  (error) => (signatureRejected = error?.code === 'MEDIA_VALIDATION_FAILED'),
+);
+check('downloaded bytes must match the declared image signature', signatureRejected);
+
+const failedStatus = await contentOsDraftStatus('draft-content-os-1', validHandoff.handoffId, {
+  ...backgroundDeps,
+  getClient: async () => ({
+    ...backgroundClient,
+    async getDraft(id) {
+      return {
+        ...(await backgroundClient.getDraft(id)),
+        status: 'failed',
+        targetHandle: undefined,
+        restId: undefined,
+        editUrl: undefined,
+        error: 'relay /Users/person token=abc',
+      };
+    },
+  }),
+});
+check('failed relay status exposes only a fixed public error code/message',
+  failedStatus.status === 'failed' &&
+  failedStatus.error.code === 'DRAFT_FAILED' &&
+  !JSON.stringify(failedStatus).includes('/Users/person') &&
+  !JSON.stringify(failedStatus).includes('token=abc'));
 
 // ---- 0. X 前端 queryId 动态发现 ----
 console.log('\n[0] X 前端 queryId 发现 + 缓存 + 单次刷新');
