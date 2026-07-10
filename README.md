@@ -2,6 +2,8 @@ English | [简体中文](README.zh-CN.md)
 
 # Kaitox
 
+> This repository is the Xiyangshi-maintained fork of Kaitox for the Content OS to X Article draft workflow. Original project: https://github.com/kuangjiajia/kaitox-toolkit. License: MIT.
+
 Kaitox is my personal toolkit — a growing set of small efficiency tools that share one piece of local infrastructure. Each tool reaches you through whichever surface fits: a coding agent, an Obsidian plugin, a Chrome extension, or the `kaitox` CLI.
 
 ## Features
