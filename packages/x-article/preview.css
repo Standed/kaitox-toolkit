@@ -90,6 +90,14 @@
   margin: 0 0 20px;
 }
 
+.xp-caption {
+  margin: -12px 0 20px;
+  color: var(--xp-text-muted, var(--xp-text-muted-default));
+  font-size: 14px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .xp-img {
   display: block;
   max-width: 100%;
