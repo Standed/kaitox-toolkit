@@ -13,7 +13,7 @@ import { publishXArticle, extractMermaidBlocks } from '@kaitox/x-article';
 import type { ImageFetcher, CoverFetcher } from '@kaitox/x-article';
 import type { DraftBundle, HttpRelayClient } from '@kaitox/relay-protocol';
 import { createQueryIdRefreshingFetch } from './query-id-discovery.js';
-import { readCt0, getSettings, refreshArticleQueryIds } from './xsession.js';
+import { readCt0, getArticleQueryIds, refreshArticleQueryIds } from './xsession.js';
 import { renderMermaidPng } from './mermaid-render.js';
 
 export interface UploadResult {
@@ -28,7 +28,7 @@ export async function uploadDraft(
 ): Promise<UploadResult> {
   const ct0 = readCt0();
   if (!ct0) throw new Error('读取不到 ct0——请确认当前已登录 x.com 再试。');
-  const { queryIds } = await getSettings();
+  const queryIds = await getArticleQueryIds();
   const xFetch = createQueryIdRefreshingFetch(
     window.fetch.bind(window) as any,
     queryIds,

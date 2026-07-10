@@ -27,37 +27,54 @@ const FALLBACK_ARTICLE_QUERY_IDS: ArticleQueryIds = {
   ArticleEntityUpdateCoverMedia: ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
 };
 
+const SETTINGS_KEYS = [
+  'relayBase',
+  'queryId',
+  'titleQueryId',
+  'contentQueryId',
+  'coverQueryId',
+  'relayToken',
+  'showUploadButton',
+] as const;
+
+async function readStoredSettings(): Promise<Record<string, any>> {
+  try {
+    return await chrome.storage.sync.get([...SETTINGS_KEYS]);
+  } catch {
+    return {};
+  }
+}
+
+function applyQueryIdOverrides(stored: Record<string, any>, defaults: ArticleQueryIds): ArticleQueryIds {
+  return {
+    ArticleEntityDraftCreate: stored.queryId || defaults.ArticleEntityDraftCreate,
+    ArticleEntityUpdateTitle: stored.titleQueryId || defaults.ArticleEntityUpdateTitle,
+    ArticleEntityUpdateContent: stored.contentQueryId || defaults.ArticleEntityUpdateContent,
+    ArticleEntityUpdateCoverMedia: stored.coverQueryId || defaults.ArticleEntityUpdateCoverMedia,
+  };
+}
+
+/** Resolve query IDs only when an upload actually needs X's network API. */
+export async function getArticleQueryIds(): Promise<ArticleQueryIds> {
+  const stored = await readStoredSettings();
+  const discovered = await resolveArticleQueryIds(FALLBACK_ARTICLE_QUERY_IDS);
+  return applyQueryIdOverrides(stored, discovered);
+}
+
 /** Force a live X frontend scan, falling back to bundled IDs only when discovery fails. */
 export async function refreshArticleQueryIds(): Promise<ArticleQueryIds> {
-  return resolveArticleQueryIds(FALLBACK_ARTICLE_QUERY_IDS, { forceRefresh: true });
+  const stored = await readStoredSettings();
+  const discovered = await resolveArticleQueryIds(FALLBACK_ARTICLE_QUERY_IDS, { forceRefresh: true });
+  return applyQueryIdOverrides(stored, discovered);
 }
 
 /** 读取插件设置（chrome.storage.sync），带默认值。 */
 export async function getSettings(): Promise<Settings> {
-  let stored: Record<string, any> = {};
-  try {
-    stored = await chrome.storage.sync.get([
-      'relayBase',
-      'queryId',
-      'titleQueryId',
-      'contentQueryId',
-      'coverQueryId',
-      'relayToken',
-      'showUploadButton',
-    ]);
-  } catch {
-    /* storage 不可用时用默认 */
-  }
-  const discoveredQueryIds = await resolveArticleQueryIds(FALLBACK_ARTICLE_QUERY_IDS);
+  const stored = await readStoredSettings();
   return {
     relayBase: stored.relayBase || DEFAULT_RELAY_BASE,
-    // Explicit user override → current X frontend discovery/cache → bundled fallback.
-    queryIds: {
-      ArticleEntityDraftCreate: stored.queryId || discoveredQueryIds.ArticleEntityDraftCreate,
-      ArticleEntityUpdateTitle: stored.titleQueryId || discoveredQueryIds.ArticleEntityUpdateTitle,
-      ArticleEntityUpdateContent: stored.contentQueryId || discoveredQueryIds.ArticleEntityUpdateContent,
-      ArticleEntityUpdateCoverMedia: stored.coverQueryId || discoveredQueryIds.ArticleEntityUpdateCoverMedia,
-    },
+    // Ordinary relay/UI settings never trigger frontend network discovery.
+    queryIds: applyQueryIdOverrides(stored, FALLBACK_ARTICLE_QUERY_IDS),
     token: stored.relayToken || undefined,
     showUploadButton: stored.showUploadButton !== false,
   };

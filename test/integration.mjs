@@ -38,12 +38,24 @@ const discoveryBuild = await buildTestModule({
 const discoveryModuleUrl = `data:text/javascript;base64,${Buffer.from(discoveryBuild.outputFiles[0].contents).toString('base64')}`;
 const {
   QUERY_ID_CACHE_KEY,
+  QUERY_ID_FAILURE_CACHE_KEY,
+  QUERY_ID_FAILURE_TTL_MS,
   QUERY_ID_TTL_MS,
   createQueryIdRefreshingFetch,
   discoverArticleQueryIds,
   extractArticleOperations,
   resolveArticleQueryIds,
 } = await import(discoveryModuleUrl);
+
+const xsessionBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/xsession.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const xsessionModuleUrl = `data:text/javascript;base64,${Buffer.from(xsessionBuild.outputFiles[0].contents).toString('base64')}`;
 
 const BASE = 'http://127.0.0.1:8788';
 let pass = 0,
@@ -96,6 +108,11 @@ check(
   '解析 operationName → queryId',
   extractArticleOperations(reversed).ArticleEntityUpdateTitle === 'title_456',
 );
+const nearbyWrongId = `{queryId:"RIGHT_CONTENT",padding:"${'x'.repeat(200)}",operationName:"ArticleEntityUpdateContent"},{queryId:"WRONG_NEARBY"}`;
+check(
+  'operation 只映射同一对象里的 queryId',
+  extractArticleOperations(nearbyWrongId).ArticleEntityUpdateContent === 'RIGHT_CONTENT',
+);
 
 const bundleBase = 'https://abs.twimg.com/responsive-web/client-web';
 const bundleUrls = Array.from({ length: 5 }, (_, i) => `${bundleBase}/task5-${i + 1}.js`);
@@ -143,6 +160,147 @@ const cachedIds = await discoverArticleQueryIds({
   now: () => now + QUERY_ID_TTL_MS - 1,
 });
 check('24h 内直接使用 cache', JSON.stringify(cachedIds) === JSON.stringify(liveIds));
+
+const boundaryIds = allQueryIds('BOUNDARY');
+let boundaryFetches = 0;
+const boundaryBundle = `${bundleBase}/boundary.js`;
+const boundaryResult = await discoverArticleQueryIds({
+  fetchImpl: async (url) => {
+    boundaryFetches++;
+    return new Response(url === boundaryBundle
+      ? Object.entries(boundaryIds).map(([operationName, queryId]) => `operationName:"${operationName}",queryId:"${queryId}"`).join(';')
+      : `<script src="${boundaryBundle}"></script>`, { status: 200 });
+  },
+  storage,
+  now: () => now + QUERY_ID_TTL_MS,
+});
+check('恰好 24h 时 cache 过期并重新发现',
+  boundaryFetches >= 2 && JSON.stringify(boundaryResult) === JSON.stringify(boundaryIds));
+
+const runtimeIds = allQueryIds('RUNTIME');
+const runtimeBundle = `${bundleBase}/bundle.TwitterArticles.8202180a.js`;
+const runtimeSource = `p.u=e=>""+({67713:"bundle.TwitterArticles"}[e]||e)+"."+({67713:"8202180"})[e]+"a.js",p.p="${bundleBase}/"`;
+const runtimeFetches = [];
+const runtimeResult = await discoverArticleQueryIds({
+  fetchImpl: async (url) => {
+    runtimeFetches.push(url);
+    if (url === runtimeBundle) {
+      return new Response(Object.entries(runtimeIds)
+        .map(([operationName, queryId]) => `e.exports={queryId:"${queryId}",operationName:"${operationName}",operationType:"mutation"}`)
+        .join(';'), { status: 200 });
+    }
+    return new Response(runtimeSource, { status: 200 });
+  },
+  storage: makeStorage(),
+  pages: ['https://x.com/compose/articles'],
+});
+check('webpack runtime/chunk map 定位动态 TwitterArticles bundle',
+  runtimeFetches.includes(runtimeBundle) && JSON.stringify(runtimeResult) === JSON.stringify(runtimeIds));
+
+const resourceIds = allQueryIds('RESOURCE');
+const resourceBundle = `${bundleBase}/bundle.TwitterArticles.resourcea.js`;
+const resourceResult = await discoverArticleQueryIds({
+  fetchImpl: async (url) => new Response(Object.entries(resourceIds)
+    .map(([operationName, queryId]) => `queryId:"${queryId}",operationName:"${operationName}"`)
+    .join(';'), { status: url === resourceBundle ? 200 : 404 }),
+  storage: makeStorage(),
+  pages: [],
+  resourceUrls: [resourceBundle],
+});
+check('已加载 performance resource 可直接发现 TwitterArticles bundle',
+  JSON.stringify(resourceResult) === JSON.stringify(resourceIds));
+
+const sharedStorage = makeStorage();
+let sharedFetches = 0;
+let releaseSharedPage;
+const sharedPage = new Promise((resolve) => { releaseSharedPage = resolve; });
+const sharedBundle = `${bundleBase}/shared.js`;
+const sharedFetch = async (url) => {
+  sharedFetches++;
+  if (url === sharedBundle) {
+    return new Response(Object.entries(allQueryIds('SHARED'))
+      .map(([operationName, queryId]) => `queryId:"${queryId}",operationName:"${operationName}"`)
+      .join(';'), { status: 200 });
+  }
+  await sharedPage;
+  return new Response(`<script src="${sharedBundle}"></script>`, { status: 200 });
+};
+const sharedA = discoverArticleQueryIds({ fetchImpl: sharedFetch, storage: sharedStorage, pages: ['https://x.com/a'] });
+const sharedB = discoverArticleQueryIds({ fetchImpl: sharedFetch, storage: sharedStorage, pages: ['https://x.com/a'] });
+releaseSharedPage();
+const [sharedResultA, sharedResultB] = await Promise.all([sharedA, sharedB]);
+check('并发调用共享同一个 discovery in-flight promise',
+  sharedFetches === 2 && JSON.stringify(sharedResultA) === JSON.stringify(sharedResultB));
+
+const timeoutFallback = allQueryIds('TIMEOUT_FALLBACK');
+const timeoutStorage = makeStorage();
+let timeoutFetches = 0;
+const boundedResult = await Promise.race([
+  resolveArticleQueryIds(timeoutFallback, {
+    fetchImpl: async () => {
+      timeoutFetches++;
+      return new Promise(() => {});
+    },
+    storage: timeoutStorage,
+    pages: ['https://x.com/hangs'],
+    fetchTimeoutMs: 10,
+  }),
+  new Promise((resolve) => setTimeout(() => resolve('HUNG'), 100)),
+]);
+const cachedFailureResult = await resolveArticleQueryIds(timeoutFallback, {
+  fetchImpl: async () => {
+    timeoutFetches++;
+    return new Response('must not retry during failure TTL', { status: 500 });
+  },
+  storage: timeoutStorage,
+  pages: ['https://x.com/hangs'],
+});
+check('discovery fetch 有超时上限且失败会负缓存',
+  boundedResult !== 'HUNG' && timeoutFetches === 1 &&
+    timeoutStorage.values[QUERY_ID_FAILURE_CACHE_KEY]?.ttlMs === QUERY_ID_FAILURE_TTL_MS &&
+    JSON.stringify(cachedFailureResult) === JSON.stringify(timeoutFallback));
+
+const staleStorage = makeStorage();
+const staleCachedIds = allQueryIds('STALE_CACHE');
+staleStorage.values[QUERY_ID_CACHE_KEY] = { ids: staleCachedIds, fetchedAt: now, ttlMs: QUERY_ID_TTL_MS };
+let staleNow = now + QUERY_ID_TTL_MS;
+let staleFetchMode = 'fail';
+let staleFetches = 0;
+const recoveredIds = allQueryIds('RECOVERED');
+const recoveryBundle = `${bundleBase}/recovery.js`;
+const staleFetch = async (url) => {
+  staleFetches++;
+  if (staleFetchMode === 'fail') return new Response('unavailable', { status: 503 });
+  return new Response(url === recoveryBundle
+    ? Object.entries(recoveredIds).map(([operationName, queryId]) => `queryId:"${queryId}",operationName:"${operationName}"`).join(';')
+    : `<script src="${recoveryBundle}"></script>`, { status: 200 });
+};
+const staleResult = await discoverArticleQueryIds({
+  fetchImpl: staleFetch,
+  storage: staleStorage,
+  pages: ['https://x.com/stale'],
+  now: () => staleNow,
+});
+const staleFetchesAfterFailure = staleFetches;
+const staleCooldownResult = await discoverArticleQueryIds({
+  fetchImpl: staleFetch,
+  storage: staleStorage,
+  pages: ['https://x.com/stale'],
+  now: () => staleNow + 1,
+});
+staleNow += QUERY_ID_FAILURE_TTL_MS;
+staleFetchMode = 'recover';
+const recoveredResult = await discoverArticleQueryIds({
+  fetchImpl: staleFetch,
+  storage: staleStorage,
+  pages: ['https://x.com/stale'],
+  now: () => staleNow,
+});
+check('过期 cache 在失败期兜底，负缓存到期后可恢复',
+  JSON.stringify(staleResult) === JSON.stringify(staleCachedIds) &&
+    JSON.stringify(staleCooldownResult) === JSON.stringify(staleCachedIds) &&
+    staleFetches === staleFetchesAfterFailure + 2 &&
+    JSON.stringify(recoveredResult) === JSON.stringify(recoveredIds));
 
 const forcedIds = allQueryIds('FORCED');
 const forcedHtml = `${bundleBase}/forced.js`;
@@ -217,6 +375,49 @@ await operationRetryFetch('https://x.com/i/api/graphql/OLD_CONTENT/ArticleEntity
   body: JSON.stringify({ queryId: 'OLD_CONTENT' }),
 });
 check('operation-not-found 也只刷新并重试一次', operationRefreshes === 1 && operationCalls === 2);
+
+let unrelatedRefreshes = 0;
+const unrelatedResponse = new Response(JSON.stringify({ errors: [{ message: 'You are not allowed to edit this article' }] }), {
+  status: 403,
+});
+const unrelatedFetch = createQueryIdRefreshingFetch(
+  async () => unrelatedResponse,
+  allQueryIds('UNCHANGED'),
+  async () => {
+    unrelatedRefreshes++;
+    return allQueryIds('UNUSED');
+  },
+);
+const unrelatedResult = await unrelatedFetch(
+  'https://x.com/i/api/graphql/UNCHANGED_CONTENT/ArticleEntityUpdateContent',
+  { method: 'POST', body: JSON.stringify({ queryId: 'UNCHANGED_CONTENT' }) },
+);
+check('无关 GraphQL 错误原样透传且不触发 discovery',
+  unrelatedResult === unrelatedResponse && unrelatedRefreshes === 0);
+
+let ordinaryNetworkCalls = 0;
+globalThis.window = { fetch: async () => { ordinaryNetworkCalls++; throw new Error('ordinary settings must not fetch'); } };
+globalThis.chrome = {
+  storage: {
+    sync: {
+      async get() {
+        return { relayBase: 'http://127.0.0.1:9999', relayToken: 'local-token' };
+      },
+    },
+    local: {
+      async get() {
+        ordinaryNetworkCalls++;
+        throw new Error('ordinary settings must not read discovery cache');
+      },
+    },
+  },
+};
+const { getSettings: getOrdinarySettings } = await import(xsessionModuleUrl);
+const ordinarySettings = await getOrdinarySettings();
+check('普通 relay/UI 设置读取与网络 discovery 解耦',
+  ordinarySettings.relayBase === 'http://127.0.0.1:9999' &&
+    ordinarySettings.token === 'local-token' &&
+    ordinaryNetworkCalls === 0);
 
 const handle = await startRelay();
 try {
