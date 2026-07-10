@@ -184,7 +184,13 @@ try {
   check('create 用了 queryId', create.url.includes('CREATE_QID'));
   check('create credentials=include', create.credentials === 'include');
   check('create 无手动 cookie 头', !('cookie' in create.headers));
-  check('create 只建空白草稿', JSON.stringify(JSON.parse(create.body).variables) === '{}');
+  check(
+    'create 使用已确认可用的空白草稿 variables',
+    JSON.stringify(JSON.parse(create.body).variables) === JSON.stringify({
+      content_state: { blocks: [], entity_map: [] },
+      title: '',
+    }),
+  );
   const titleCall = calls.find((c) => c.url.includes('/ArticleEntityUpdateTitle'));
   check('title mutation 用了 TITLE_QID', titleCall?.url.includes('TITLE_QID'));
   check('title mutation 传 articleEntityId + title', titleCall && JSON.stringify(JSON.parse(titleCall.body).variables) === JSON.stringify({ articleEntityId: 'ART_777', title: '集成测试' }));

@@ -4,7 +4,7 @@
  * 直接复用 @kaitox/x-article 的 publishXArticle，只替换两处：
  *   - fetchImage：从 relay 的 assets 端点取字节，而不是从网络下载 URL。
  *   - clientOptions：同源 fetch + credentials:'include'（页面已登录，自动带 cookie），
- *     并用解析出的 queryId。
+ *     并用四个已配置的 queryId。
  *
  * bundle.markdown 已由上传端按 mode 处理完（plaintext 已降级），这里无需再转换；
  * 唯一的额外变换是 mermaid 围栏：默认渲染成 PNG 走图片通道（X 没有 mermaid 支持）。
@@ -27,7 +27,7 @@ export async function uploadDraft(
 ): Promise<UploadResult> {
   const ct0 = readCt0();
   if (!ct0) throw new Error('读取不到 ct0——请确认当前已登录 x.com 再试。');
-  const { queryId, coverQueryId } = await getSettings();
+  const { queryIds } = await getSettings();
 
   // mermaid 围栏 → 图片引用；先串行预渲染，语法错误在上传前就报清楚（不半途丢图）。
   const { markdown, blocks: mermaidBlocks } = extractMermaidBlocks(draft.markdown);
@@ -63,8 +63,7 @@ export async function uploadDraft(
     clientOptions: {
       fetchImpl: window.fetch.bind(window) as any,
       credentialsMode: 'include',
-      articleDraftCreateQueryId: queryId,
-      updateCoverMediaQueryId: coverQueryId,
+      queryIds,
     },
     fetchImage,
     fetchCover,

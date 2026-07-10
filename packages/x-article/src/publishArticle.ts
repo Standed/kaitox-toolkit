@@ -196,11 +196,21 @@ async function mapLimit<T>(
   worker: (item: T, index: number) => Promise<void>,
 ): Promise<void> {
   let i = 0;
+  let stopped = false;
+  let firstError: unknown;
   const runners = new Array(Math.min(limit, items.length || 1)).fill(0).map(async () => {
-    while (i < items.length) {
+    while (!stopped && i < items.length) {
       const idx = i++;
-      await worker(items[idx], idx);
+      try {
+        await worker(items[idx], idx);
+      } catch (error) {
+        if (!stopped) {
+          stopped = true;
+          firstError = error;
+        }
+      }
     }
   });
   await Promise.all(runners);
+  if (stopped) throw firstError;
 }

@@ -272,13 +272,19 @@ const operationName = (url) => {
   return match?.[1];
 };
 
-const makeGraphqlMock = (calls, responses = {}) => {
+const makeGraphqlMock = (calls, responses = {}, options = {}) => {
   let mediaId = 0;
   return async (url, init = {}) => {
     calls.push({ url: String(url), ...init });
     if (String(url).includes('command=INIT')) return okJson({ media_id_string: `MEDIA_${++mediaId}` });
     if (String(url).includes('command=APPEND')) return okJson({});
-    if (String(url).includes('command=FINALIZE')) return okJson({});
+    if (String(url).includes('command=FINALIZE')) {
+      const finalizedId = new URL(String(url)).searchParams.get('media_id');
+      const value = typeof options.finalize === 'function'
+        ? options.finalize(finalizedId)
+        : { media_id_string: finalizedId };
+      return okJson(value);
+    }
     const operation = operationName(url);
     if (operation && operation in responses) return okJson(responses[operation]);
     throw new Error(`unexpected request: ${url}`);
@@ -314,7 +320,13 @@ check('strict publish 返回精确编辑链接', strictResult.editUrl === 'https
 const createCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityDraftCreate');
 const titleCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityUpdateTitle');
 const contentCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityUpdateContent');
-check('create 是空白草稿', createCall && JSON.stringify(JSON.parse(createCall.body).variables) === '{}');
+check(
+  'create 使用 X 已确认可用的空白草稿 variables',
+  createCall && JSON.stringify(JSON.parse(createCall.body).variables) === JSON.stringify({
+    content_state: { blocks: [], entity_map: [] },
+    title: '',
+  }),
+);
 check(
   'title body 使用 articleEntityId + title',
   titleCall && JSON.stringify(JSON.parse(titleCall.body).variables) === JSON.stringify({ articleEntityId: 'ART_777', title: '标题' }),
@@ -343,6 +355,37 @@ await rejectsWith(
   () => graphqlErrorClient.updateArticleTitle('ART_777', '标题'),
   /GraphQL.*title failed/,
 );
+
+for (const [name, method, response] of [
+  [
+    'title mutation success=false 时失败',
+    (client) => client.updateArticleTitle('ART_777', '标题'),
+    { data: { articleentity_update_title: { success: false } } },
+  ],
+  [
+    'content mutation payload=null 时失败',
+    (client) => client.updateArticleContent('ART_777', { blocks: [], entity_map: [] }),
+    { data: { articleentity_update_content: null } },
+  ],
+  [
+    'cover mutation success=null 时失败',
+    (client) => client.updateCoverMedia('ART_777', 'MEDIA_1'),
+    { data: { articleentity_update_cover_media: { success: null } } },
+  ],
+]) {
+  const operationClient = new XArticleClient(
+    { bearerToken: '', csrfToken: 'CT0' },
+    {
+      queryIds: QUERY_IDS,
+      fetchImpl: makeGraphqlMock([], {
+        ArticleEntityUpdateTitle: response,
+        ArticleEntityUpdateContent: response,
+        ArticleEntityUpdateCoverMedia: response,
+      }),
+    },
+  );
+  await rejectsWith(name, () => method(operationClient), /未确认成功/);
+}
 
 const httpErrorClient = new XArticleClient(
   { bearerToken: '', csrfToken: 'CT0' },
@@ -398,6 +441,20 @@ await rejectsWith(
 );
 
 await rejectsWith(
+  '正文图 FINALIZE 缺少 media_id_string 时终止',
+  () => publishXArticle({
+    markdown: '# 标题\n\n![图](body.png)',
+    credentials: { bearerToken: '', csrfToken: 'CT0' },
+    clientOptions: {
+      queryIds: QUERY_IDS,
+      fetchImpl: makeGraphqlMock([], successResponses, { finalize: () => ({}) }),
+    },
+    fetchImage: async () => ({ bytes: new Uint8Array([1]), mimeType: 'image/png' }),
+  }),
+  /FINALIZE.*media_id_string/,
+);
+
+await rejectsWith(
   '封面下载或上传失败会终止',
   () => publishXArticle({
     markdown: '# 标题\n\n正文',
@@ -406,6 +463,47 @@ await rejectsWith(
     fetchCover: async () => { throw new Error('cover failed'); },
   }),
   /cover failed/,
+);
+
+await rejectsWith(
+  '封面 FINALIZE 返回错配 media_id_string 时终止',
+  () => publishXArticle({
+    markdown: '# 标题\n\n正文',
+    credentials: { bearerToken: '', csrfToken: 'CT0' },
+    clientOptions: {
+      queryIds: QUERY_IDS,
+      fetchImpl: makeGraphqlMock([], successResponses, { finalize: () => ({ media_id_string: 'OTHER_MEDIA' }) }),
+    },
+    fetchCover: async () => ({ bytes: new Uint8Array([1]), mimeType: 'image/png' }),
+  }),
+  /FINALIZE.*不匹配/,
+);
+
+const startedImages = [];
+let queueFailure;
+try {
+  await publishXArticle({
+    markdown: '# 标题\n\n![1](1.png)\n\n![2](2.png)\n\n![3](3.png)\n\n![4](4.png)',
+    credentials: { bearerToken: '', csrfToken: 'CT0' },
+    clientOptions: { queryIds: QUERY_IDS, fetchImpl: makeGraphqlMock([], successResponses) },
+    imageConcurrency: 2,
+    fetchImage: async (src) => {
+      startedImages.push(src);
+      if (src === '1.png') throw new Error('stop upload queue');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { bytes: new Uint8Array([1]), mimeType: 'image/png' };
+    },
+  });
+} catch (error) {
+  queueFailure = error;
+}
+await new Promise((resolve) => setTimeout(resolve, 50));
+check(
+  '首个正文图失败后不再启动队列中的新上传',
+  queueFailure instanceof Error &&
+    /stop upload queue/.test(queueFailure.message) &&
+    JSON.stringify(startedImages) === JSON.stringify(['1.png', '2.png']),
+  `(started ${startedImages.join(', ')})`,
 );
 
 console.log(`\n== ${pass} passed, ${fail} failed ==`);

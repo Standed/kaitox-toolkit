@@ -2,16 +2,18 @@
 import { HttpRelayClient } from '@kaitox/relay-protocol';
 import {
   ARTICLE_DRAFT_CREATE_QUERY_ID,
+  ARTICLE_UPDATE_TITLE_QUERY_ID,
+  ARTICLE_UPDATE_CONTENT_QUERY_ID,
   ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
 } from '@kaitox/x-article';
+import type { ArticleQueryIds } from '@kaitox/x-article';
 
 export { DEFAULT_RELAY_BASE } from '@kaitox/relay-protocol';
 import { DEFAULT_RELAY_BASE } from '@kaitox/relay-protocol';
 
 export interface Settings {
   relayBase: string;
-  queryId: string;
-  coverQueryId: string;
+  queryIds: ArticleQueryIds;
   token?: string;
   /** 是否在 X 文章草稿页显示「上传草稿」按钮（设置页开关，默认开）。 */
   showUploadButton: boolean;
@@ -24,6 +26,8 @@ export async function getSettings(): Promise<Settings> {
     stored = await chrome.storage.sync.get([
       'relayBase',
       'queryId',
+      'titleQueryId',
+      'contentQueryId',
       'coverQueryId',
       'relayToken',
       'showUploadButton',
@@ -33,9 +37,13 @@ export async function getSettings(): Promise<Settings> {
   }
   return {
     relayBase: stored.relayBase || DEFAULT_RELAY_BASE,
-    // queryId 解析顺序：用户覆盖 → 内置常量（运行时抓取见 P5）。
-    queryId: stored.queryId || ARTICLE_DRAFT_CREATE_QUERY_ID,
-    coverQueryId: stored.coverQueryId || ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
+    // queryId 解析顺序：用户覆盖 → 内置常量（运行时抓取留给 Task 5）。
+    queryIds: {
+      ArticleEntityDraftCreate: stored.queryId || ARTICLE_DRAFT_CREATE_QUERY_ID,
+      ArticleEntityUpdateTitle: stored.titleQueryId || ARTICLE_UPDATE_TITLE_QUERY_ID,
+      ArticleEntityUpdateContent: stored.contentQueryId || ARTICLE_UPDATE_CONTENT_QUERY_ID,
+      ArticleEntityUpdateCoverMedia: stored.coverQueryId || ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
+    },
     token: stored.relayToken || undefined,
     showUploadButton: stored.showUploadButton !== false,
   };

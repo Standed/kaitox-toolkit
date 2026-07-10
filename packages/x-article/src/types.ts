@@ -174,7 +174,10 @@ export interface ArticleFieldToggles {
 }
 
 export interface ArticleDraftCreateBody {
-  variables: Record<string, never>;
+  variables: {
+    content_state: ContentState;
+    title: string;
+  };
   features: ArticleFeatures;
   fieldToggles: ArticleFieldToggles;
   queryId: string;

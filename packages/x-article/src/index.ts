@@ -26,13 +26,15 @@ export {
   sanitizeContentState,
   DEFAULT_BEARER_TOKEN,
   ARTICLE_DRAFT_CREATE_QUERY_ID,
+  ARTICLE_UPDATE_TITLE_QUERY_ID,
+  ARTICLE_UPDATE_CONTENT_QUERY_ID,
   ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
   DEFAULT_ARTICLE_FEATURES,
   DEFAULT_COVER_MEDIA_FEATURES,
   DEFAULT_ARTICLE_FIELD_TOGGLES,
 } from './xArticleClient.js';
 export type { XArticleClientOptions, FetchLike } from './xArticleClient.js';
-export { assertGraphqlSuccess } from './graphql.js';
+export { assertGraphqlMutationSuccess, assertGraphqlSuccess } from './graphql.js';
 export {
   publishXArticle,
   deriveTitle,

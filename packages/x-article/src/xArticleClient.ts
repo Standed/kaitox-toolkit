@@ -26,7 +26,7 @@ import type {
   UploadMediaCategory,
 } from './types';
 import { INLINE_STYLES } from './types.js';
-import { assertGraphqlSuccess } from './graphql.js';
+import { assertGraphqlMutationSuccess, assertGraphqlSuccess } from './graphql.js';
 
 /** 所有 x.com 网页端共用的公开 bearer token（长期不变）。 */
 export const DEFAULT_BEARER_TOKEN =
@@ -34,6 +34,12 @@ export const DEFAULT_BEARER_TOKEN =
 
 /** ArticleEntityDraftCreate 的 GraphQL queryId。X 会不定期轮换，需要时覆盖。 */
 export const ARTICLE_DRAFT_CREATE_QUERY_ID = 'g1l5N8BxGewYuCy5USe_bQ';
+
+/** ArticleEntityUpdateTitle 的 GraphQL queryId。 */
+export const ARTICLE_UPDATE_TITLE_QUERY_ID = '5wp_YbfxSfYJTiLWb4tYnA';
+
+/** ArticleEntityUpdateContent 的 GraphQL queryId。 */
+export const ARTICLE_UPDATE_CONTENT_QUERY_ID = 'IzVdegTuct9uoXRK5L93Qg';
 
 /** ArticleEntityUpdateCoverMedia 的 GraphQL queryId（设置封面）。同样会轮换。 */
 export const ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID = 'AbzX20PDk6TTzqmN67hiPQ';
@@ -181,6 +187,13 @@ export class XArticleClient {
     // 3) FINALIZE
     const finalizeUrl = `${UPLOAD_URL}?command=FINALIZE&media_id=${mediaId}`;
     const finalize = await this.postJson(finalizeUrl, null);
+    const finalizedMediaId = finalize?.media_id_string;
+    if (typeof finalizedMediaId !== 'string' || !finalizedMediaId.trim()) {
+      throw new Error(`FINALIZE 未返回 media_id_string：${JSON.stringify(finalize)}`);
+    }
+    if (finalizedMediaId !== mediaId) {
+      throw new Error(`FINALIZE media_id_string 与 INIT 不匹配：${mediaId} != ${finalizedMediaId}`);
+    }
     // 视频/GIF 会返回 processing_info 需要轮询 STATUS；图片一般即时完成。
     if (finalize?.processing_info?.state && finalize.processing_info.state !== 'succeeded') {
       await this.waitForProcessing(mediaId);
@@ -218,7 +231,10 @@ export class XArticleClient {
     const operation: ArticleOperation = 'ArticleEntityDraftCreate';
     const queryId = this.queryIdFor(operation);
     const body: ArticleDraftCreateBody = {
-      variables: {},
+      variables: {
+        content_state: { blocks: [], entity_map: [] },
+        title: '',
+      },
       features: this.features,
       fieldToggles: this.fieldToggles,
       queryId,
@@ -240,7 +256,7 @@ export class XArticleClient {
     };
     const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
     const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
-    assertGraphqlSuccess(operation, raw);
+    assertGraphqlMutationSuccess(operation, raw, 'articleentity_update_title');
     return { raw };
   }
 
@@ -258,7 +274,7 @@ export class XArticleClient {
     };
     const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
     const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
-    assertGraphqlSuccess(operation, raw);
+    assertGraphqlMutationSuccess(operation, raw, 'articleentity_update_content');
     return { raw };
   }
 
@@ -281,7 +297,7 @@ export class XArticleClient {
     };
     const url = `${GRAPHQL_BASE}/${queryId}/${operation}`;
     const raw = await this.postJson(url, JSON.stringify(body), { 'content-type': 'application/json' });
-    assertGraphqlSuccess(operation, raw);
+    assertGraphqlMutationSuccess(operation, raw, 'articleentity_update_cover_media');
     return { raw };
   }
 
