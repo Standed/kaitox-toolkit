@@ -51,10 +51,12 @@ kaitox-relay start
 | `source` | `DraftSource` | 产生它的推送方：`'cli' \| 'obsidian' \| 'unknown'`，或任何你自己的字符串。 |
 | `sourceMeta?` | `Record<string, unknown>` | 推送方的自由格式元数据。 |
 | `status?` | `DraftStatus` | **由 relay 维护。** `'pending' \| 'uploading' \| 'done' \| 'failed'`。 |
+| `targetHandle?` | `string` | **由 relay 维护。** 成功时由消费端回填并核验的目标 X 账号 handle。 |
 | `restId?` | `string` | **由 relay 维护。** 成功后由消费端回填（对 X Article 而言是文章的 `rest_id`）。 |
+| `editUrl?` | `string` | **由 relay 维护。** 精确的 X Article 规范编辑地址 `https://x.com/compose/articles/edit/${restId}`，成功时回填。 |
 | `error?` | `string` | **由 relay 维护。** 失败信息，通过 `ack` 设置。 |
 
-这三个由 relay 维护的字段不包含在你 POST 的内容里——线上请求体中的 bundle 类型为 `Omit<DraftBundle, 'status' | 'restId' | 'error'>`。
+这四个由 relay 维护的字段不包含在你 POST 的内容里——线上请求体中的 bundle 类型为 `Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>`。`done` ack 必须同时提供这三个终态结果字段。
 
 ### `DraftAsset`
 

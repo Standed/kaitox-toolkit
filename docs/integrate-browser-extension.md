@@ -193,8 +193,9 @@ The full lifecycle for a single draft, mirroring
 2. `getDraft(id)` — fetch the full `DraftBundle` (Markdown + asset metadata).
 3. `publishXArticle(...)` with a custom `fetchImage` that resolves each Markdown image
    `src` to its bundle asset and pulls the bytes from the relay.
-4. On success: `ack(id, { status: 'done', restId })`. On failure:
-   `ack(id, { status: 'failed', error })`.
+4. On success: verify the active `targetHandle` and non-empty `restId`, derive the exact
+   canonical `editUrl`, then call `ack(id, { status: 'done', targetHandle, restId, editUrl })`.
+   On failure: `ack(id, { status: 'failed', error })`.
 
 ```ts
 // uploader.ts
@@ -270,15 +271,17 @@ async function processDraft(id: string, client: HttpRelayClient): Promise<void> 
   try {
     const draft = await client.getDraft(id);
     const result = await uploadDraft(draft, client);
-    await client.ack(id, { status: 'done', restId: result.restId });
+    if (!result.restId) throw new Error('Draft created but no restId was returned; not acknowledging success.');
+    const targetHandle = readTargetHandle(); // resolve the active X account from the page session
+    if (!targetHandle) throw new Error('Unable to verify the active X account; not acknowledging success.');
+    const editUrl = `https://x.com/compose/articles/edit/${result.restId}`;
+    await client.ack(id, { status: 'done', targetHandle, restId: result.restId, editUrl });
 
     if (result.skippedImages.length) {
       console.warn('Some images failed to upload and were skipped:', result.skippedImages);
     }
-    // Open the freshly created draft in the composer.
-    if (result.restId) {
-      location.assign(`/compose/articles/edit/${result.restId}`);
-    }
+    // Open the freshly created draft using the same canonical URL that was acknowledged.
+    setTimeout(() => location.assign(editUrl), 600);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // .catch(() => {}) so a dead relay doesn't mask the original error.
@@ -293,7 +296,9 @@ Behavior worth knowing:
 - **A single failed image does not abort the article.** `publishXArticle` skips it,
   omits it from the body, and reports it in `result.skippedImages`.
 - **`restId` can be `undefined`** if X's response shape changes and the ID cannot be
-  extracted; the draft is still created — point the user to their article list.
+  extracted; treat that as a failed upload and do not acknowledge `done`. A successful
+  acknowledgement must include `targetHandle`, `restId`, and the exact
+  `https://x.com/compose/articles/edit/${restId}` URL.
 - **The cover never enters the body.** It is uploaded after draft creation and attached
   via a separate `ArticleEntityUpdateCoverMedia` mutation; a cover failure leaves the
   created draft intact.

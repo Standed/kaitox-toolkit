@@ -190,8 +190,9 @@ setInterval(async () => {
 2. `getDraft(id)`——获取完整的 `DraftBundle`（Markdown + asset 元数据）。
 3. `publishXArticle(...)`，配合一个自定义的 `fetchImage`，把每个 Markdown 图片
    `src` 解析到它对应的草稿包 asset，并从 relay 拉取字节。
-4. 成功时：`ack(id, { status: 'done', restId })`。失败时：
-   `ack(id, { status: 'failed', error })`。
+4. 成功时：先核验当前 `targetHandle` 和非空的 `restId`，再生成精确的规范
+   `editUrl`，调用 `ack(id, { status: 'done', targetHandle, restId, editUrl })`。
+   失败时：`ack(id, { status: 'failed', error })`。
 
 ```ts
 // uploader.ts
@@ -267,15 +268,17 @@ async function processDraft(id: string, client: HttpRelayClient): Promise<void> 
   try {
     const draft = await client.getDraft(id);
     const result = await uploadDraft(draft, client);
-    await client.ack(id, { status: 'done', restId: result.restId });
+    if (!result.restId) throw new Error('草稿已创建，但没有返回 restId，不写入成功状态。');
+    const targetHandle = readTargetHandle(); // 从页面会话读取并核验当前 X 账号
+    if (!targetHandle) throw new Error('无法核验当前 X 账号，不写入成功状态。');
+    const editUrl = `https://x.com/compose/articles/edit/${result.restId}`;
+    await client.ack(id, { status: 'done', targetHandle, restId: result.restId, editUrl });
 
     if (result.skippedImages.length) {
       console.warn('Some images failed to upload and were skipped:', result.skippedImages);
     }
-    // 在编辑器中打开刚创建好的草稿。
-    if (result.restId) {
-      location.assign(`/compose/articles/edit/${result.restId}`);
-    }
+    // 使用与 ack 中相同的规范地址打开刚创建好的草稿。
+    setTimeout(() => location.assign(editUrl), 600);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // .catch(() => {}) 这样一个已失效的 relay 不会掩盖原始错误。
@@ -290,7 +293,8 @@ async function processDraft(id: string, client: HttpRelayClient): Promise<void> 
 - **单张图片失败不会中断整篇文章。** `publishXArticle` 会跳过它、
   将其从正文中省略，并在 `result.skippedImages` 中报告。
 - **`restId` 可能为 `undefined`**，如果 X 的响应结构发生变化、无法从中提取出 ID；
-  草稿仍然会被创建——把用户引导到他们的文章列表即可。
+  此时应视为上传失败，不要写入 `done`。成功 ack 必须同时包含 `targetHandle`、`restId`
+  和精确的 `https://x.com/compose/articles/edit/${restId}` 地址。
 - **封面永远不会进入正文。** 它在草稿创建之后才上传，并通过一个单独的
   `ArticleEntityUpdateCoverMedia` mutation 挂上去；封面失败不会影响已创建的草稿。
 - 防范双击（参考扩展会维护一个由草稿 ID 组成的 `busy` 集合）。

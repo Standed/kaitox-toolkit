@@ -135,7 +135,7 @@ if (!(await isRelayUp())) {
 | `GET /:kind/drafts/:id` | 获取单个草稿包 → `DraftBundle`（先查 outbox，再查 sent；跨 kind 访问 → `404`） |
 | `GET /:kind/drafts/:id/assets/:fileName` | 原始资产字节 → `application/octet-stream` |
 | `PUT /:kind/drafts/:id/cover` | 设置/替换封面（`SetCoverWireBody`）→ 更新后的 `DraftBundle` |
-| `PATCH /:kind/drafts/:id` | 更新 `{ status, restId?, error? }` → 更新后的 `DraftBundle`；`done` 会把它移到 `sent/` |
+| `PATCH /:kind/drafts/:id` | 更新 `DraftAckPatch` → 更新后的 `DraftBundle`；`done` 必须带 `targetHandle`、`restId` 和精确的 `https://x.com/compose/articles/edit/${restId}`，然后才会移到 `sent/` |
 | `DELETE /:kind/drafts/:id` | 从 outbox 和 sent 中删除草稿 → `{ deleted }` |
 | `/drafts*` | `410 Gone`——v0.5 之前的根路由，应答中附迁移提示 |
 

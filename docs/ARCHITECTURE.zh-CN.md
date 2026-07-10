@@ -160,7 +160,7 @@ GET    /:kind/drafts                         server-side filtered by kind
 GET    /:kind/drafts/:id
 GET    /:kind/drafts/:id/assets/:fileName    raw binary
 PUT    /:kind/drafts/:id/cover               body: SetCoverWireBody
-PATCH  /:kind/drafts/:id                     body: { status, restId?, error? }
+PATCH  /:kind/drafts/:id                     body: DraftAckPatch；`done` 必须带 targetHandle、restId 和精确的规范 editUrl
 DELETE /:kind/drafts/:id
 /drafts*                                     410 Gone (pre-v0.5 root routes; migration hint)
 ```
@@ -174,7 +174,7 @@ kind 路径段必须匹配 `/^[a-z0-9][a-z0-9-]*$/`，且不能是保留字（`h
 ```ts
 // packages/relay-protocol/src/relayClient.ts
 interface PostDraftWireBody {
-  bundle: Omit<DraftBundle, 'status' | 'restId' | 'error'>;
+  bundle: Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>;
   assets: Array<{ fileName: string; mime: string; base64: string }>;
 }
 ```

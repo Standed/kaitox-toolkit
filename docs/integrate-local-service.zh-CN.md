@@ -143,7 +143,7 @@ async function waitForResult(relay, id, { intervalMs = 5000, timeoutMs = 600_000
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const bundle = await relay.getDraft(id);
-    if (bundle.status === 'done') return bundle;   // bundle.restId = the created article's rest_id
+    if (bundle.status === 'done') return bundle;   // 包含 targetHandle、restId 和精确的规范 editUrl
     if (bundle.status === 'failed') throw new Error(bundle.error ?? 'upload failed');
     await new Promise((r) => setTimeout(r, intervalMs));
   }
@@ -151,7 +151,7 @@ async function waitForResult(relay, id, { intervalMs = 5000, timeoutMs = 600_000
 }
 
 const done = await waitForResult(relay, id);
-console.log(`draft created, rest_id = ${done.restId}`);
+console.log({ targetHandle: done.targetHandle, restId: done.restId, editUrl: done.editUrl });
 ```
 
 注意：当一条草稿到达 `done` 时，relay 会把它从 `~/.kaitox/<kind>/outbox/` 移动到 `~/.kaitox/<kind>/sent/`。`GET /:kind/drafts/:id` 和 `GET /:kind/drafts` 列表仍然会包含它（状态为 `status: 'done'`）。
@@ -218,7 +218,7 @@ const { id } = await relay.postDraft({
 }
 ```
 
-规则回顾：`bundle.assets[].src` 必须与 `collectImageSources(bundle.markdown)` 的输出完全一致；顶层的 `assets` 数组携带实际的字节（base64），以 `fileName` 为键，其中也包含封面的字节；`cover` 是可选的；`bundle.kind` 是可选的，但若存在则必须等于路由的 kind 路径段（无论如何 relay 都会把路径里的 kind 盖印到存储的草稿包上）；`bundle.status` / `restId` / `error` 必须省略——这些由 relay 掌管。格式错误的请求体会被以 `400 { error, issues }` 拒绝，其中每个 issue 都带有一个 JSONPath 风格的位置。
+规则回顾：`bundle.assets[].src` 必须与 `collectImageSources(bundle.markdown)` 的输出完全一致；顶层的 `assets` 数组携带实际的字节（base64），以 `fileName` 为键，其中也包含封面的字节；`cover` 是可选的；`bundle.kind` 是可选的，但若存在则必须等于路由的 kind 路径段（无论如何 relay 都会把路径里的 kind 盖印到存储的草稿包上）；`bundle.status` / `targetHandle` / `restId` / `editUrl` / `error` 必须省略——这些由 relay 掌管。格式错误的请求体会被以 `400 { error, issues }` 拒绝，其中每个 issue 都带有一个 JSONPath 风格的位置。
 
 ```bash
 # Build the base64 payloads (tr strips GNU coreutils' line wrapping):
@@ -232,10 +232,10 @@ curl -sS -X POST http://127.0.0.1:8765/x-article/drafts \
 # → 201 {"id":"3f6c2f4e-9a1b-4c8d-b7e2-0d5f6a7b8c9d"}
 
 # Poll:
-curl -sS http://127.0.0.1:8765/x-article/drafts/3f6c2f4e-9a1b-4c8d-b7e2-0d5f6a7b8c9d | jq '{status, restId, error}'
+curl -sS http://127.0.0.1:8765/x-article/drafts/3f6c2f4e-9a1b-4c8d-b7e2-0d5f6a7b8c9d | jq '{status, targetHandle, restId, editUrl, error}'
 ```
 
-完整的 REST 接口面：`GET /health`、`GET /setting`、`PATCH /setting`（`{token?}`）、`POST /:kind/drafts`、`GET /:kind/drafts`、`GET /:kind/drafts/:id`、`GET /:kind/drafts/:id/assets/:fileName`（二进制）、`PUT /:kind/drafts/:id/cover`、`PATCH /:kind/drafts/:id`（`{status, restId?, error?}`）、`DELETE /:kind/drafts/:id`。kind 路径段必须匹配 `/^[a-z0-9][a-z0-9-]*$/` 且不能是保留字（`health`、`setting`、`drafts`）。v0.5 之前的根路由（`/drafts...`）会返回 `410 Gone` 并附带迁移提示。
+完整的 REST 接口面：`GET /health`、`GET /setting`、`PATCH /setting`（`{token?}`）、`POST /:kind/drafts`、`GET /:kind/drafts`、`GET /:kind/drafts/:id`、`GET /:kind/drafts/:id/assets/:fileName`（二进制）、`PUT /:kind/drafts/:id/cover`、`PATCH /:kind/drafts/:id`（`DraftAckPatch`）、`DELETE /:kind/drafts/:id`。成功 ack 是严格契约：必须同时提供 `targetHandle`、`restId` 和 `editUrl`，且 `editUrl` 必须精确等于 `https://x.com/compose/articles/edit/${restId}`。kind 路径段必须匹配 `/^[a-z0-9][a-z0-9-]*$/` 且不能是保留字（`health`、`setting`、`drafts`）。v0.5 之前的根路由（`/drafts...`）会返回 `410 Gone` 并附带迁移提示。
 
 服务端客户端不会遇到 CORS（没有 `Origin` 头的请求总是被允许）。任意来源的浏览器页面*会*被拦截——允许列表只覆盖 x.com/twitter.com、`chrome-extension://` 和 Obsidian。
 
@@ -289,15 +289,20 @@ for (const item of await relay.listDrafts()) { // GET /my-feature/drafts — alr
       const bytes = await relay.getAsset(item.id, asset.fileName);
       // ...consume bundle.markdown + bytes however your feature wants...
     }
-    // restId is named for X but is just a free-form result id.
-    await relay.ack(item.id, { status: 'done', restId: 'whatever-you-produced' });
+    // 当前 relay 对所有 kind 都要求严格的终态契约。
+    await relay.ack(item.id, {
+      status: 'done',
+      targetHandle: '@account_name',
+      restId: '1234567890',
+      editUrl: 'https://x.com/compose/articles/edit/1234567890',
+    });
   } catch (err) {
     await relay.ack(item.id, { status: 'failed', error: String(err) });
   }
 }
 ```
 
-挑一个满足路径段规则的 kind：`/^[a-z0-9][a-z0-9-]*$/`，且不是保留字之一（`health`、`setting`、`drafts`）。跨 kind 访问是不可见的：以某个 kind 发布的草稿在任何其他 kind 下都会 404。
+自定义 kind 对 relay 仍然是不透明的，并按路由隔离；但当前成功 `done` ack 仍必须遵守上面的严格终态格式。如果自定义消费端无法如实提供兼容 X Article 的 `editUrl`，就保持非终态，或先扩展协议再增加自定义终态结果；不要再发送旧式的 `{ status: 'done', restId }` ack。挑一个满足路径段规则的 kind：`/^[a-z0-9][a-z0-9-]*$/`，且不是保留字之一（`health`、`setting`、`drafts`）。跨 kind 访问是不可见的：以某个 kind 发布的草稿在任何其他 kind 下都会 404。
 
 ## 排障
 

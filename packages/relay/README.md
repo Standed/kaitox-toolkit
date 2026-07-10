@@ -135,7 +135,7 @@ Draft routes are namespaced by `kind` (`/:kind/drafts...`): the path segment is 
 | `GET /:kind/drafts/:id` | Fetch one bundle → `DraftBundle` (outbox, then sent; cross-kind access → `404`) |
 | `GET /:kind/drafts/:id/assets/:fileName` | Raw asset bytes → `application/octet-stream` |
 | `PUT /:kind/drafts/:id/cover` | Set/replace the cover (`SetCoverWireBody`) → updated `DraftBundle` |
-| `PATCH /:kind/drafts/:id` | Update `{ status, restId?, error? }` → updated `DraftBundle`; `done` moves it to `sent/` |
+| `PATCH /:kind/drafts/:id` | Update a `DraftAckPatch` → updated `DraftBundle`; `done` requires `targetHandle`, `restId`, and exact `https://x.com/compose/articles/edit/${restId}`, then moves it to `sent/` |
 | `DELETE /:kind/drafts/:id` | Remove a draft from outbox and sent → `{ deleted }` |
 | `/drafts*` | `410 Gone` — pre-v0.5 root routes, answered with a migration hint |
 

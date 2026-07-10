@@ -144,7 +144,7 @@ async function waitForResult(relay, id, { intervalMs = 5000, timeoutMs = 600_000
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const bundle = await relay.getDraft(id);
-    if (bundle.status === 'done') return bundle;   // bundle.restId = the created article's rest_id
+    if (bundle.status === 'done') return bundle;   // includes targetHandle, restId, and the exact canonical editUrl
     if (bundle.status === 'failed') throw new Error(bundle.error ?? 'upload failed');
     await new Promise((r) => setTimeout(r, intervalMs));
   }
@@ -152,7 +152,7 @@ async function waitForResult(relay, id, { intervalMs = 5000, timeoutMs = 600_000
 }
 
 const done = await waitForResult(relay, id);
-console.log(`draft created, rest_id = ${done.restId}`);
+console.log({ targetHandle: done.targetHandle, restId: done.restId, editUrl: done.editUrl });
 ```
 
 Note: when a draft reaches `done` the relay moves it from `~/.kaitox/<kind>/outbox/` to `~/.kaitox/<kind>/sent/`. Both `GET /:kind/drafts/:id` and the `GET /:kind/drafts` listing still include it (with `status: 'done'`).
@@ -219,7 +219,7 @@ For non-Node stacks, POST the `PostDraftWireBody` JSON directly. You must genera
 }
 ```
 
-Rules recap: `bundle.assets[].src` must equal `collectImageSources(bundle.markdown)` output exactly; the top-level `assets` array carries the actual bytes (base64) keyed by `fileName`, including the cover's bytes; `cover` is optional; `bundle.kind` is optional but if present must equal the route's kind segment (the relay stamps the path kind onto the stored bundle either way); `bundle.status` / `restId` / `error` must be omitted — the relay owns those. Malformed bodies are rejected with `400 { error, issues }` where each issue has a JSONPath-style location.
+Rules recap: `bundle.assets[].src` must equal `collectImageSources(bundle.markdown)` output exactly; the top-level `assets` array carries the actual bytes (base64) keyed by `fileName`, including the cover's bytes; `cover` is optional; `bundle.kind` is optional but if present must equal the route's kind segment (the relay stamps the path kind onto the stored bundle either way); `bundle.status` / `targetHandle` / `restId` / `editUrl` / `error` must be omitted — the relay owns those. Malformed bodies are rejected with `400 { error, issues }` where each issue has a JSONPath-style location.
 
 ```bash
 # Build the base64 payloads (tr strips GNU coreutils' line wrapping):
@@ -233,10 +233,10 @@ curl -sS -X POST http://127.0.0.1:8765/x-article/drafts \
 # → 201 {"id":"3f6c2f4e-9a1b-4c8d-b7e2-0d5f6a7b8c9d"}
 
 # Poll:
-curl -sS http://127.0.0.1:8765/x-article/drafts/3f6c2f4e-9a1b-4c8d-b7e2-0d5f6a7b8c9d | jq '{status, restId, error}'
+curl -sS http://127.0.0.1:8765/x-article/drafts/3f6c2f4e-9a1b-4c8d-b7e2-0d5f6a7b8c9d | jq '{status, targetHandle, restId, editUrl, error}'
 ```
 
-Full REST surface: `GET /health`, `GET /setting`, `PATCH /setting` (`{token?}`), `POST /:kind/drafts`, `GET /:kind/drafts`, `GET /:kind/drafts/:id`, `GET /:kind/drafts/:id/assets/:fileName` (binary), `PUT /:kind/drafts/:id/cover`, `PATCH /:kind/drafts/:id` (`{status, restId?, error?}`), `DELETE /:kind/drafts/:id`. Kind segments must match `/^[a-z0-9][a-z0-9-]*$/` and not be a reserved word (`health`, `setting`, `drafts`). The pre-v0.5 root routes (`/drafts...`) return `410 Gone` with a migration hint.
+Full REST surface: `GET /health`, `GET /setting`, `PATCH /setting` (`{token?}`), `POST /:kind/drafts`, `GET /:kind/drafts`, `GET /:kind/drafts/:id`, `GET /:kind/drafts/:id/assets/:fileName` (binary), `PUT /:kind/drafts/:id/cover`, `PATCH /:kind/drafts/:id` (`DraftAckPatch`), `DELETE /:kind/drafts/:id`. A successful ack is strict: it must include `targetHandle`, `restId`, and `editUrl`, with `editUrl` exactly `https://x.com/compose/articles/edit/${restId}`. Kind segments must match `/^[a-z0-9][a-z0-9-]*$/` and not be a reserved word (`health`, `setting`, `drafts`). The pre-v0.5 root routes (`/drafts...`) return `410 Gone` with a migration hint.
 
 Server-side clients don't hit CORS (requests with no `Origin` header are always allowed). Browser pages on arbitrary origins *will* be blocked — the allowlist covers only x.com/twitter.com, `chrome-extension://`, and Obsidian.
 
@@ -293,15 +293,20 @@ for (const item of await relay.listDrafts()) { // GET /my-feature/drafts — alr
       const bytes = await relay.getAsset(item.id, asset.fileName);
       // ...consume bundle.markdown + bytes however your feature wants...
     }
-    // restId is named for X but is just a free-form result id.
-    await relay.ack(item.id, { status: 'done', restId: 'whatever-you-produced' });
+    // The relay's current terminal contract is strict for every kind.
+    await relay.ack(item.id, {
+      status: 'done',
+      targetHandle: '@account_name',
+      restId: '1234567890',
+      editUrl: 'https://x.com/compose/articles/edit/1234567890',
+    });
   } catch (err) {
     await relay.ack(item.id, { status: 'failed', error: String(err) });
   }
 }
 ```
 
-Pick a kind that satisfies the path-segment rule: `/^[a-z0-9][a-z0-9-]*$/`, not one of the reserved words (`health`, `setting`, `drafts`). Cross-kind access is invisible: a draft posted under one kind 404s under any other.
+Custom kinds remain opaque to the relay and are isolated by route, but their successful `done` ack still uses the current strict terminal shape above. If a custom consumer cannot truthfully provide that X Article-compatible `editUrl`, keep it non-terminal or extend the protocol before adding a custom terminal result; do not send a legacy `{ status: 'done', restId }` ack. Pick a kind that satisfies the path-segment rule: `/^[a-z0-9][a-z0-9-]*$/`, not one of the reserved words (`health`, `setting`, `drafts`). Cross-kind access is invisible: a draft posted under one kind 404s under any other.
 
 ## Troubleshooting
 

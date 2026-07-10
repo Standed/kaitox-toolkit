@@ -51,10 +51,12 @@ A **draft bundle** is one unit of work: raw Markdown + image bytes + metadata, p
 | `source` | `DraftSource` | Which pusher produced it: `'cli' \| 'obsidian' \| 'unknown'` or any string of your own. |
 | `sourceMeta?` | `Record<string, unknown>` | Free-form pusher metadata. |
 | `status?` | `DraftStatus` | **Relay-maintained.** `'pending' \| 'uploading' \| 'done' \| 'failed'`. |
+| `targetHandle?` | `string` | **Relay-maintained.** Verified target X account handle, backfilled by the consumer on success. |
 | `restId?` | `string` | **Relay-maintained.** Backfilled by the consumer on success (for X Articles, the article's `rest_id`). |
+| `editUrl?` | `string` | **Relay-maintained.** Exact canonical X Article edit URL, `https://x.com/compose/articles/edit/${restId}`, backfilled on success. |
 | `error?` | `string` | **Relay-maintained.** Failure message, set via `ack`. |
 
-The three relay-maintained fields are excluded from what you POST — the wire body's bundle is typed `Omit<DraftBundle, 'status' | 'restId' | 'error'>`.
+The four relay-maintained fields are excluded from what you POST — the wire body's bundle is typed `Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>`. A `done` ack must provide all three terminal result fields.
 
 ### `DraftAsset`
 

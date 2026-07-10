@@ -180,7 +180,7 @@ GET    /:kind/drafts                         server-side filtered by kind
 GET    /:kind/drafts/:id
 GET    /:kind/drafts/:id/assets/:fileName    raw binary
 PUT    /:kind/drafts/:id/cover               body: SetCoverWireBody
-PATCH  /:kind/drafts/:id                     body: { status, restId?, error? }
+PATCH  /:kind/drafts/:id                     body: DraftAckPatch; `done` requires targetHandle, restId, and exact canonical editUrl
 DELETE /:kind/drafts/:id
 /drafts*                                     410 Gone (pre-v0.5 root routes; migration hint)
 ```
@@ -194,7 +194,7 @@ reserved word (`health`, `setting`, `drafts`) — see `isValidKindSegment` in
 ```ts
 // packages/relay-protocol/src/relayClient.ts
 interface PostDraftWireBody {
-  bundle: Omit<DraftBundle, 'status' | 'restId' | 'error'>;
+  bundle: Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>;
   assets: Array<{ fileName: string; mime: string; base64: string }>;
 }
 ```
