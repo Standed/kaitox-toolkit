@@ -7,6 +7,7 @@ import {
   ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
 } from '@kaitox/x-article';
 import type { ArticleQueryIds } from '@kaitox/x-article';
+import { resolveArticleQueryIds } from './query-id-discovery.js';
 
 export { DEFAULT_RELAY_BASE } from '@kaitox/relay-protocol';
 import { DEFAULT_RELAY_BASE } from '@kaitox/relay-protocol';
@@ -17,6 +18,18 @@ export interface Settings {
   token?: string;
   /** 是否在 X 文章草稿页显示「上传草稿」按钮（设置页开关，默认开）。 */
   showUploadButton: boolean;
+}
+
+const FALLBACK_ARTICLE_QUERY_IDS: ArticleQueryIds = {
+  ArticleEntityDraftCreate: ARTICLE_DRAFT_CREATE_QUERY_ID,
+  ArticleEntityUpdateTitle: ARTICLE_UPDATE_TITLE_QUERY_ID,
+  ArticleEntityUpdateContent: ARTICLE_UPDATE_CONTENT_QUERY_ID,
+  ArticleEntityUpdateCoverMedia: ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
+};
+
+/** Force a live X frontend scan, falling back to bundled IDs only when discovery fails. */
+export async function refreshArticleQueryIds(): Promise<ArticleQueryIds> {
+  return resolveArticleQueryIds(FALLBACK_ARTICLE_QUERY_IDS, { forceRefresh: true });
 }
 
 /** 读取插件设置（chrome.storage.sync），带默认值。 */
@@ -35,14 +48,15 @@ export async function getSettings(): Promise<Settings> {
   } catch {
     /* storage 不可用时用默认 */
   }
+  const discoveredQueryIds = await resolveArticleQueryIds(FALLBACK_ARTICLE_QUERY_IDS);
   return {
     relayBase: stored.relayBase || DEFAULT_RELAY_BASE,
-    // queryId 解析顺序：用户覆盖 → 内置常量（运行时抓取留给 Task 5）。
+    // Explicit user override → current X frontend discovery/cache → bundled fallback.
     queryIds: {
-      ArticleEntityDraftCreate: stored.queryId || ARTICLE_DRAFT_CREATE_QUERY_ID,
-      ArticleEntityUpdateTitle: stored.titleQueryId || ARTICLE_UPDATE_TITLE_QUERY_ID,
-      ArticleEntityUpdateContent: stored.contentQueryId || ARTICLE_UPDATE_CONTENT_QUERY_ID,
-      ArticleEntityUpdateCoverMedia: stored.coverQueryId || ARTICLE_UPDATE_COVER_MEDIA_QUERY_ID,
+      ArticleEntityDraftCreate: stored.queryId || discoveredQueryIds.ArticleEntityDraftCreate,
+      ArticleEntityUpdateTitle: stored.titleQueryId || discoveredQueryIds.ArticleEntityUpdateTitle,
+      ArticleEntityUpdateContent: stored.contentQueryId || discoveredQueryIds.ArticleEntityUpdateContent,
+      ArticleEntityUpdateCoverMedia: stored.coverQueryId || discoveredQueryIds.ArticleEntityUpdateCoverMedia,
     },
     token: stored.relayToken || undefined,
     showUploadButton: stored.showUploadButton !== false,

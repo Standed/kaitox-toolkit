@@ -12,7 +12,8 @@
 import { publishXArticle, extractMermaidBlocks } from '@kaitox/x-article';
 import type { ImageFetcher, CoverFetcher } from '@kaitox/x-article';
 import type { DraftBundle, HttpRelayClient } from '@kaitox/relay-protocol';
-import { readCt0, getSettings } from './xsession.js';
+import { createQueryIdRefreshingFetch } from './query-id-discovery.js';
+import { readCt0, getSettings, refreshArticleQueryIds } from './xsession.js';
 import { renderMermaidPng } from './mermaid-render.js';
 
 export interface UploadResult {
@@ -28,6 +29,11 @@ export async function uploadDraft(
   const ct0 = readCt0();
   if (!ct0) throw new Error('读取不到 ct0——请确认当前已登录 x.com 再试。');
   const { queryIds } = await getSettings();
+  const xFetch = createQueryIdRefreshingFetch(
+    window.fetch.bind(window) as any,
+    queryIds,
+    refreshArticleQueryIds,
+  );
 
   // mermaid 围栏 → 图片引用；先串行预渲染，语法错误在上传前就报清楚（不半途丢图）。
   const { markdown, blocks: mermaidBlocks } = extractMermaidBlocks(draft.markdown);
@@ -61,7 +67,7 @@ export async function uploadDraft(
     title: draft.title,
     credentials: { bearerToken: '', csrfToken: ct0 },
     clientOptions: {
-      fetchImpl: window.fetch.bind(window) as any,
+      fetchImpl: xFetch,
       credentialsMode: 'include',
       queryIds,
     },

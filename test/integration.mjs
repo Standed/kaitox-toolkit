@@ -1,5 +1,6 @@
 /**
- * 端到端集成测试（自包含）：进程内起 relay，跑三条链路的断言。
+ * 端到端集成测试（自包含）：进程内起 relay，跑四条链路的断言。
+ *   0. X 前端 queryId 发现 + 24h 缓存 + 失效后单次刷新
  *   1. relay CRUD + 封面字节 + 目录穿越防护 + done→sent
  *   2. 插件上传流水线（relay 拉字节 → publishXArticle mock 掉 X 接口 → content_state 正确 + 封面 mutation）
  *   3. styleCheck + 纯文本兜底通用不变量
@@ -9,6 +10,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { build as buildTestModule } from 'esbuild';
 
 // 必须在 import relay 之前设好，config 每次读 env。
 const home = await mkdtemp(join(tmpdir(), 'kaitox-itest-'));
@@ -25,6 +27,24 @@ const {
   DEFAULT_COVER_MEDIA_FEATURES,
 } = await import('@kaitox/x-article');
 
+const discoveryBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/query-id-discovery.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const discoveryModuleUrl = `data:text/javascript;base64,${Buffer.from(discoveryBuild.outputFiles[0].contents).toString('base64')}`;
+const {
+  QUERY_ID_CACHE_KEY,
+  QUERY_ID_TTL_MS,
+  createQueryIdRefreshingFetch,
+  discoverArticleQueryIds,
+  extractArticleOperations,
+  resolveArticleQueryIds,
+} = await import(discoveryModuleUrl);
+
 const BASE = 'http://127.0.0.1:8788';
 let pass = 0,
   fail = 0;
@@ -37,6 +57,166 @@ const pngBytes = Uint8Array.from(
   atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='),
   (c) => c.charCodeAt(0),
 );
+
+const makeStorage = () => {
+  const values = {};
+  const removed = [];
+  return {
+    values,
+    removed,
+    async get(key) {
+      return { [key]: values[key] };
+    },
+    async set(patch) {
+      Object.assign(values, patch);
+    },
+    async remove(key) {
+      removed.push(key);
+      delete values[key];
+    },
+  };
+};
+
+const allQueryIds = (prefix) => ({
+  ArticleEntityDraftCreate: `${prefix}_CREATE`,
+  ArticleEntityUpdateTitle: `${prefix}_TITLE`,
+  ArticleEntityUpdateContent: `${prefix}_CONTENT`,
+  ArticleEntityUpdateCoverMedia: `${prefix}_COVER`,
+});
+
+// ---- 0. X 前端 queryId 动态发现 ----
+console.log('\n[0] X 前端 queryId 发现 + 缓存 + 单次刷新');
+const fixture = `e.exports={queryId:"abc_123",operationName:"ArticleEntityUpdateContent"};`;
+check(
+  '解析 queryId → operationName',
+  extractArticleOperations(fixture).ArticleEntityUpdateContent === 'abc_123',
+);
+const reversed = `operationName:"ArticleEntityUpdateTitle",queryId:"title_456"`;
+check(
+  '解析 operationName → queryId',
+  extractArticleOperations(reversed).ArticleEntityUpdateTitle === 'title_456',
+);
+
+const bundleBase = 'https://abs.twimg.com/responsive-web/client-web';
+const bundleUrls = Array.from({ length: 5 }, (_, i) => `${bundleBase}/task5-${i + 1}.js`);
+const pageHtml = bundleUrls.map((url) => `<script src="${url}"></script>`).join('');
+const bundleBodies = new Map([
+  [bundleUrls[0], `queryId:"LIVE_CREATE",operationName:"ArticleEntityDraftCreate"`],
+  [bundleUrls[1], `operationName:"ArticleEntityUpdateTitle",queryId:"LIVE_TITLE"`],
+  [bundleUrls[2], `queryId:"LIVE_CONTENT",operationName:"ArticleEntityUpdateContent"`],
+  [bundleUrls[3], `operationName:"ArticleEntityUpdateCoverMedia",queryId:"LIVE_COVER"`],
+  [bundleUrls[4], 'unused fifth bundle'],
+]);
+const storage = makeStorage();
+const fetchedUrls = [];
+let activeBundles = 0;
+let maxActiveBundles = 0;
+const discoveryFetch = async (url) => {
+  fetchedUrls.push(url);
+  if (url.startsWith(bundleBase)) {
+    activeBundles++;
+    maxActiveBundles = Math.max(maxActiveBundles, activeBundles);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeBundles--;
+    return new Response(bundleBodies.get(url), { status: 200 });
+  }
+  return new Response(pageHtml, { status: 200 });
+};
+const now = 1_800_000_000_000;
+const liveIds = await discoverArticleQueryIds({ fetchImpl: discoveryFetch, storage, now: () => now });
+check('四个 operation 精确映射', JSON.stringify(liveIds) === JSON.stringify({
+  ArticleEntityDraftCreate: 'LIVE_CREATE',
+  ArticleEntityUpdateTitle: 'LIVE_TITLE',
+  ArticleEntityUpdateContent: 'LIVE_CONTENT',
+  ArticleEntityUpdateCoverMedia: 'LIVE_COVER',
+}));
+check('前端 bundle 最多四并发', maxActiveBundles === 4);
+check('集齐四个 operation 后停止抓 bundle', !fetchedUrls.includes(bundleUrls[4]));
+check('local cache 写入 ids + fetchedAt + 24h TTL',
+  storage.values[QUERY_ID_CACHE_KEY]?.fetchedAt === now &&
+    storage.values[QUERY_ID_CACHE_KEY]?.ttlMs === 86_400_000 &&
+    QUERY_ID_TTL_MS === 86_400_000,
+);
+const cachedIds = await discoverArticleQueryIds({
+  fetchImpl: async () => { throw new Error('fresh cache must not fetch'); },
+  storage,
+  now: () => now + QUERY_ID_TTL_MS - 1,
+});
+check('24h 内直接使用 cache', JSON.stringify(cachedIds) === JSON.stringify(liveIds));
+
+const forcedIds = allQueryIds('FORCED');
+const forcedHtml = `${bundleBase}/forced.js`;
+let forcedFetches = 0;
+await discoverArticleQueryIds({
+  fetchImpl: async (url) => {
+    forcedFetches++;
+    return new Response(url === forcedHtml
+      ? Object.entries(forcedIds).map(([operationName, queryId]) => `operationName:"${operationName}",queryId:"${queryId}"`).join(';')
+      : `<script src="${forcedHtml}"></script>`, { status: 200 });
+  },
+  storage,
+  now: () => now + 1,
+  forceRefresh: true,
+});
+check('强制刷新先清 cache 再重新发现', storage.removed.includes(QUERY_ID_CACHE_KEY) && forcedFetches >= 2);
+
+const fallbackIds = allQueryIds('FALLBACK');
+const resolvedFallback = await resolveArticleQueryIds(fallbackIds, {
+  fetchImpl: async () => new Response('unavailable', { status: 503 }),
+  storage: makeStorage(),
+});
+check('前端发现失败时才用内置 fallback', JSON.stringify(resolvedFallback) === JSON.stringify(fallbackIds));
+
+const staleIds = allQueryIds('STALE');
+const freshIds = allQueryIds('FRESH');
+const retryCalls = [];
+let refreshCount = 0;
+const retryingFetch = createQueryIdRefreshingFetch(
+  async (url, init) => {
+    retryCalls.push({ url, body: init?.body });
+    return new Response(retryCalls.length === 1 ? 'not found' : JSON.stringify({ data: { ok: true } }), {
+      status: retryCalls.length === 1 ? 404 : 200,
+    });
+  },
+  staleIds,
+  async () => {
+    refreshCount++;
+    return freshIds;
+  },
+);
+await retryingFetch(
+  `https://x.com/i/api/graphql/${staleIds.ArticleEntityUpdateTitle}/ArticleEntityUpdateTitle`,
+  { method: 'POST', body: JSON.stringify({ queryId: staleIds.ArticleEntityUpdateTitle, variables: { title: 'T' } }) },
+);
+check('GraphQL 404 只刷新一次并重试同一 operation',
+  refreshCount === 1 && retryCalls.length === 2 &&
+    retryCalls[1].url.includes(`/${freshIds.ArticleEntityUpdateTitle}/ArticleEntityUpdateTitle`),
+);
+check('刷新后同步 URL、body 和后续 operation 映射',
+  retryCalls[1] && JSON.parse(retryCalls[1].body).queryId === freshIds.ArticleEntityUpdateTitle &&
+    staleIds.ArticleEntityUpdateContent === freshIds.ArticleEntityUpdateContent,
+);
+
+let operationRefreshes = 0;
+let operationCalls = 0;
+const operationRetryFetch = createQueryIdRefreshingFetch(
+  async () => {
+    operationCalls++;
+    return new Response(operationCalls === 1
+      ? JSON.stringify({ errors: [{ message: 'Operation ArticleEntityUpdateContent not found' }] })
+      : JSON.stringify({ data: { ok: true } }), { status: 200 });
+  },
+  allQueryIds('OLD'),
+  async () => {
+    operationRefreshes++;
+    return allQueryIds('NEW');
+  },
+);
+await operationRetryFetch('https://x.com/i/api/graphql/OLD_CONTENT/ArticleEntityUpdateContent', {
+  method: 'POST',
+  body: JSON.stringify({ queryId: 'OLD_CONTENT' }),
+});
+check('operation-not-found 也只刷新并重试一次', operationRefreshes === 1 && operationCalls === 2);
 
 const handle = await startRelay();
 try {
