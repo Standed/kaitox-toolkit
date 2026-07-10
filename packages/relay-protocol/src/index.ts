@@ -16,6 +16,7 @@
 export type {
   DraftBundle,
   DraftAsset,
+  DraftAckPatch,
   DraftListItem,
   DraftKind,
   DraftMode,
@@ -44,7 +45,7 @@ export {
   isValidKindSegment,
   RESERVED_KIND_SEGMENTS,
 } from './validate.js';
-export type { WireIssue, WireResult, AckPatch, SettingPatch } from './validate.js';
+export type { WireIssue, WireResult, SettingPatch } from './validate.js';
 export type {
   RelayClient,
   PostDraftInput,

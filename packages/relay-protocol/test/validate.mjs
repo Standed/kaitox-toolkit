@@ -143,8 +143,26 @@ check(
 
 // --- validateAckPatch -----------------------------------------------------------
 
-check('合法 ack 通过', validateAckPatch({ status: 'done', restId: 'R_1' }).ok);
-check('全部 status 枚举通过', ['pending', 'uploading', 'done', 'failed'].every((s) => validateAckPatch({ status: s }).ok));
+const checkInvalidAck = (ack, paths) => {
+  const result = validateAckPatch(ack);
+  check(`非法 ack → ${paths.join(', ')} issue`, !result.ok && paths.every((path) => issuePaths(result).includes(`$.${path}`)));
+};
+const checkValidAck = (ack) => check('合法 ack 通过', validateAckPatch(ack).ok);
+
+checkInvalidAck(
+  { status: 'done', restId: '', editUrl: '' },
+  ['restId', 'editUrl'],
+);
+checkInvalidAck(
+  { status: 'done', restId: '2075186898188841140', editUrl: 'https://x.com/compose/articles/edit/other' },
+  ['editUrl'],
+);
+checkValidAck({
+  status: 'done',
+  restId: '2075186898188841140',
+  editUrl: 'https://x.com/compose/articles/edit/2075186898188841140',
+});
+check('非成功 status 枚举通过', ['pending', 'uploading', 'failed'].every((s) => validateAckPatch({ status: s }).ok));
 check('非法 status → $.status issue', issuePaths(validateAckPatch({ status: 'oops' })).includes('$.status'));
 check('缺 status → $.status issue', issuePaths(validateAckPatch({})).includes('$.status'));
 check('restId 非字符串 → issue', issuePaths(validateAckPatch({ status: 'done', restId: 5 })).includes('$.restId'));

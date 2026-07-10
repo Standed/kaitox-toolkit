@@ -6,7 +6,7 @@
 import { mkdir, readFile, writeFile, readdir, rm, rename, stat } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { base64ToBytes } from '@kaitox/relay-protocol';
-import type { DraftBundle, DraftListItem, DraftStatus, PostDraftWireBody } from '@kaitox/relay-protocol';
+import type { DraftAckPatch, DraftBundle, DraftListItem, PostDraftWireBody } from '@kaitox/relay-protocol';
 import { outboxDir, sentDir } from './config.js';
 import { fitImageBytes } from './imageFit.js';
 
@@ -194,19 +194,16 @@ export async function setCover(
 /** 更新草稿状态；status='done' 时移入 sent/。 */
 export async function patchDraft(
   id: string,
-  patch: { status: DraftStatus; restId?: string; error?: string },
+  patch: DraftAckPatch,
   kind: string,
 ): Promise<DraftBundle | null> {
   const safe = sanitizeId(id);
   const dir = draftDir(kind, safe);
   const b = await readBundleFrom(dir);
   if (!b) return null;
-  const updated: DraftBundle = {
-    ...b,
-    status: patch.status,
-    restId: patch.restId ?? b.restId,
-    error: patch.error ?? b.error,
-  };
+  const updated: DraftBundle = patch.status === 'done'
+    ? { ...b, status: 'done', restId: patch.restId, editUrl: patch.editUrl, error: undefined }
+    : { ...b, status: patch.status, error: patch.error, restId: undefined, editUrl: undefined };
   await writeFile(join(dir, BUNDLE_FILE), JSON.stringify(updated, null, 2), 'utf8');
   if (patch.status === 'done') {
     const dest = draftDir(kind, safe, true);

@@ -136,9 +136,18 @@ try {
   check('old original file cleaned up', oldOrigGone);
 
   // ack
-  await client.ack(id, { status: 'done', restId: 'R_1' });
+  await client.ack(id, {
+    status: 'done',
+    restId: 'R_1',
+    editUrl: 'https://x.com/compose/articles/edit/R_1',
+  });
   const done = await client.getDraft(id);
-  check('ack persists status + restId', done.status === 'done' && done.restId === 'R_1');
+  check(
+    'ack persists verified result',
+    done.status === 'done' &&
+      done.restId === 'R_1' &&
+      done.editUrl === 'https://x.com/compose/articles/edit/R_1',
+  );
   // done 草稿迁入 sent/ 后必须仍出现在列表里（草稿箱「已上传」Tab 依赖这一点）
   const doneInList = (await client.listDrafts()).find((d) => d.id === id);
   check('done draft stays in list', doneInList?.status === 'done');

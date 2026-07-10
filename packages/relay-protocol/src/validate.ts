@@ -14,7 +14,7 @@
  *     （需要 marked），不属于线协议。
  */
 
-import type { DraftStatus } from './bundle.js';
+import type { DraftAckPatch } from './bundle.js';
 import type { PostDraftWireBody, SetCoverWireBody } from './relayClient.js';
 
 export interface WireIssue {
@@ -144,21 +144,29 @@ export function validateSetCoverWireBody(input: unknown): WireResult<SetCoverWir
 }
 
 /** PATCH /:kind/drafts/:id 的 body（上传端回填状态）。 */
-export interface AckPatch {
-  status: DraftStatus;
-  restId?: string;
-  error?: string;
-}
-
-export function validateAckPatch(input: unknown): WireResult<AckPatch> {
+export function validateAckPatch(input: unknown): WireResult<DraftAckPatch> {
   if (!isRec(input)) return { ok: false, issues: [{ path: '$', message: 'expected object' }] };
   const issues: WireIssue[] = [];
   if (typeof input.status !== 'string' || !DRAFT_STATUSES.has(input.status)) {
     issues.push({ path: '$.status', message: `expected one of ${[...DRAFT_STATUSES].join(' | ')}` });
   }
-  if (input.restId !== undefined) pushStr(input.restId, '$.restId', issues);
-  if (input.error !== undefined) pushStr(input.error, '$.error', issues, true);
-  return issues.length ? { ok: false, issues } : { ok: true, value: input as unknown as AckPatch };
+  if (input.status === 'done') {
+    pushStr(input.restId, '$.restId', issues);
+    pushStr(input.editUrl, '$.editUrl', issues);
+    if (
+      typeof input.restId === 'string' &&
+      typeof input.editUrl === 'string' &&
+      input.editUrl !== `https://x.com/compose/articles/edit/${input.restId}`
+    ) {
+      issues.push({ path: '$.editUrl', message: 'must match the X Article edit URL for restId' });
+    }
+    if (input.error !== undefined) issues.push({ path: '$.error', message: 'not allowed when status is done' });
+  } else {
+    if (input.restId !== undefined) issues.push({ path: '$.restId', message: 'only allowed when status is done' });
+    if (input.editUrl !== undefined) issues.push({ path: '$.editUrl', message: 'only allowed when status is done' });
+    if (input.error !== undefined) pushStr(input.error, '$.error', issues, true);
+  }
+  return issues.length ? { ok: false, issues } : { ok: true, value: input as DraftAckPatch };
 }
 
 /** PATCH /setting 的 body：undefined = 不改，string = 设置，null = 清除。 */

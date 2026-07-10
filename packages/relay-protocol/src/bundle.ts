@@ -36,6 +36,11 @@ export type DraftSource = 'cli' | 'obsidian' | 'unknown' | (string & {});
 /** relay 侧维护的草稿生命周期状态。 */
 export type DraftStatus = 'pending' | 'uploading' | 'done' | 'failed';
 
+/** Status update reported by a draft consumer. */
+export type DraftAckPatch =
+  | { status: 'pending' | 'uploading' | 'failed'; error?: string }
+  | { status: 'done'; restId: string; editUrl: string; error?: never };
+
 /** 风格检查的一条问题。 */
 export interface StyleIssue {
   /** 规则 id，如 'table' / 'nested-list' / 'image-missing'。 */
@@ -115,8 +120,12 @@ export interface DraftBundle {
 
   // --- 以下字段由 relay 维护 ---
   status?: DraftStatus;
+  /** Target X account handle reported by the consumer. */
+  targetHandle?: string;
   /** 上传成功后插件回填的文章 rest_id。 */
   restId?: string;
+  /** 上传成功后插件回填的 X Article 编辑地址。 */
+  editUrl?: string;
   /** 上传失败时的错误信息。 */
   error?: string;
 }

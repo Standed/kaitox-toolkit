@@ -16,11 +16,11 @@
 
 import type {
   DraftBundle,
+  DraftAckPatch,
   DraftKind,
   DraftListItem,
   DraftMode,
   DraftSource,
-  DraftStatus,
   StyleReport,
 } from './bundle.js';
 import { DEFAULT_DRAFT_KIND, SCHEMA_VERSION } from './bundle.js';
@@ -73,13 +73,13 @@ export interface RelayClient {
   getAsset(id: string, fileName: string): Promise<Uint8Array>;
   /** 设置/替换草稿封面（写回 relay，落盘到 assets/；插件「上传封面」用）。 */
   setCover(id: string, cover: SetCoverInput): Promise<void>;
-  ack(id: string, patch: { status: DraftStatus; restId?: string; error?: string }): Promise<void>;
+  ack(id: string, patch: DraftAckPatch): Promise<void>;
   deleteDraft(id: string): Promise<void>;
 }
 
 /** POST /drafts 的线上 JSON 形态（relay 端解析这个）。 */
 export interface PostDraftWireBody {
-  bundle: Omit<DraftBundle, 'status' | 'restId' | 'error'>;
+  bundle: Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>;
   assets: Array<{ fileName: string; mime: string; base64: string }>;
 }
 
@@ -265,7 +265,7 @@ export class HttpRelayClient implements RelayClient {
     if (!res.ok) throw new RelayHttpError('PUT', url, res.status, await safeText(res));
   }
 
-  async ack(id: string, patch: { status: DraftStatus; restId?: string; error?: string }): Promise<void> {
+  async ack(id: string, patch: DraftAckPatch): Promise<void> {
     const url = `${this.draftsBase()}/${encodeURIComponent(id)}`;
     const res = await this.fetchImpl(url, {
       method: 'PATCH',
