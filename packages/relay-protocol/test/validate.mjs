@@ -66,6 +66,21 @@ const noSchema = structuredClone(validBody);
 delete noSchema.bundle.schemaVersion;
 check('schemaVersion 缺席允许（v0.2 兼容）', validatePostDraftWireBody(noSchema).ok);
 
+const withRelayOwnedFields = structuredClone(validBody);
+Object.assign(withRelayOwnedFields.bundle, {
+  status: 'done',
+  targetHandle: '@aaxiaoshi666',
+  restId: '2075186898188841140',
+  editUrl: 'https://x.com/compose/articles/edit/2075186898188841140',
+  error: 'stale result',
+});
+check(
+  'POST 拒绝 relay-owned 状态和终态字段',
+  ['status', 'targetHandle', 'restId', 'editUrl', 'error'].every((field) =>
+    issuePaths(validatePostDraftWireBody(withRelayOwnedFields)).includes(`$.bundle.${field}`),
+  ),
+);
+
 // 刻意宽松：未知字段、更高 schemaVersion、第三方 kind/source 都放行
 const forward = structuredClone(validBody);
 forward.bundle.schemaVersion = 99;

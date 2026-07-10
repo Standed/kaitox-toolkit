@@ -68,6 +68,7 @@ function checkAssetMeta(v: unknown, path: string, issues: WireIssue[]): void {
 }
 
 const DRAFT_STATUSES: ReadonlySet<string> = new Set(['pending', 'uploading', 'done', 'failed']);
+const RELAY_OWNED_POST_FIELDS = ['status', 'targetHandle', 'restId', 'editUrl', 'error'] as const;
 
 /** POST /:kind/drafts 的 body。 */
 export function validatePostDraftWireBody(input: unknown): WireResult<PostDraftWireBody> {
@@ -78,6 +79,11 @@ export function validatePostDraftWireBody(input: unknown): WireResult<PostDraftW
   if (!isRec(b)) {
     issues.push({ path: '$.bundle', message: 'expected object' });
   } else {
+    for (const field of RELAY_OWNED_POST_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(b, field)) {
+        issues.push({ path: `$.bundle.${field}`, message: 'relay-owned field is not allowed on POST' });
+      }
+    }
     pushStr(b.id, '$.bundle.id', issues);
     if (b.kind !== undefined) pushStr(b.kind, '$.bundle.kind', issues);
     pushStr(b.title, '$.bundle.title', issues, true);

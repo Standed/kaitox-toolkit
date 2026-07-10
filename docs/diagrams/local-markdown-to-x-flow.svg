@@ -97,10 +97,11 @@
   <text class="code" x="555" y="770">~/.kaitox/x-article/</text>
   <text class="small" x="640" y="799" text-anchor="middle">bundle.json + assets/</text>
 
-  <rect class="node node-blue" x="500" y="920" width="280" height="110" rx="18"/>
+  <rect class="node node-blue" x="500" y="920" width="280" height="150" rx="18"/>
   <text class="text text-strong" x="640" y="960" text-anchor="middle">记录结果</text>
-  <text class="small" x="640" y="992" text-anchor="middle">done + restId</text>
-  <text class="small" x="640" y="1017" text-anchor="middle">或 failed + error</text>
+  <text class="small" x="640" y="989" text-anchor="middle">done + targetHandle</text>
+  <text class="small" x="640" y="1015" text-anchor="middle">restId + editUrl</text>
+  <text class="small" x="640" y="1041" text-anchor="middle">或 failed + error</text>
 
   <!-- Extension lane -->
   <rect class="node node-green" x="910" y="260" width="310" height="124" rx="18"/>
