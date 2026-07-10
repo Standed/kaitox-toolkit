@@ -218,6 +218,7 @@ class ContentStateBuilder {
   private handleParagraph(token: MdToken): void {
     const inlineTokens = token.tokens ?? textFallback(token);
     const runs: MdToken[] = [];
+    let followsMedia = false;
     const flushRun = () => {
       if (runs.length === 0) return;
       const inline = this.processInline(runs);
@@ -230,19 +231,30 @@ class ContentStateBuilder {
     for (const t of inlineTokens) {
       if (t.type === 'image') {
         flushRun();
-        this.pushImage(t.href ?? '');
+        followsMedia = this.pushImage(t.href ?? '');
       } else {
-        runs.push(t);
+        // Marked retains the newline between an image and its following paragraph
+        // in this token stream. It is a structural separator, not caption content.
+        if (followsMedia && t.type === 'text' && (t.text ?? '').startsWith('\n')) {
+          runs.push({
+            ...t,
+            text: (t.text ?? '').slice(1),
+            raw: t.raw?.startsWith('\n') ? t.raw.slice(1) : t.raw,
+          });
+        } else {
+          runs.push(t);
+        }
+        followsMedia = false;
       }
     }
     flushRun();
   }
 
-  private pushImage(src: string): void {
+  private pushImage(src: string): boolean {
     const mediaId = src ? this.resolveMediaId(src) : undefined;
     if (!mediaId) {
       if (src) this.skippedImages.push(src);
-      return;
+      return false;
     }
     // local_media_id 必须等于实体自己的 key。addEntity 会把当前 nextEntityKey 分配出去，
     // 所以先取值再建实体，两者一致。
@@ -255,6 +267,7 @@ class ContentStateBuilder {
       },
     });
     this.pushAtomic(key);
+    return true;
   }
 
   /**

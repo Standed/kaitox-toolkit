@@ -8,6 +8,26 @@ import { markdownToContentState, collectImageSources, parseTweetId } from '../di
 import { sanitizeContentState, XArticleClient } from '../dist/xArticleClient.js';
 import { deriveTitle, publishXArticle } from '../dist/publishArticle.js';
 
+// Content OS exports image captions in the paragraph immediately after the image.
+// The converter must preserve that adjacency without adding media-specific fields.
+const captionMd = `![a](https://media.aizao.ai/a.webp)
+*图 1｜Seedream 5.0 Pro*`;
+const captionState = markdownToContentState(captionMd, {
+  'https://media.aizao.ai/a.webp': 'MEDIA_1',
+}).contentState;
+const captionMediaBlock = captionState.blocks[0];
+const captionTextBlock = captionState.blocks[1];
+
+if (
+  captionMediaBlock?.type !== 'atomic' ||
+  captionTextBlock?.type !== 'unstyled' ||
+  captionTextBlock.text !== '图 1｜Seedream 5.0 Pro' ||
+  JSON.stringify(captionTextBlock.inline_style_ranges) !==
+    JSON.stringify([{ offset: 0, length: 20, style: 'Italic' }])
+) {
+  throw new Error(`image caption must immediately follow its MEDIA block: ${JSON.stringify(captionState.blocks)}`);
+}
+
 const md = `# 主标题在此
 
 最近Agent Engineering圈里冒出两个词：**Harness Engineering** 和 **Loop Engineering**。

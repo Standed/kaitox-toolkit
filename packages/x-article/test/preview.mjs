@@ -149,6 +149,19 @@ check('resolveImage=null → 未打包占位（含 src）', missing.includes('xp
 const passthrough = renderPreviewHtml('![a](https://i/x.png)');
 check('不传 resolveImage → 原样用 src', passthrough.includes('<img class="xp-img" src="https://i/x.png"'));
 
+const captionPreview = renderPreviewHtml(`![a](https://i/caption.png)
+*图 1｜Seedream 5.0 Pro*`);
+check(
+  '紧邻图片的斜体图注使用 xp-caption',
+  captionPreview.includes('<p class="xp-caption"><em>图 1｜Seedream 5.0 Pro</em></p>'),
+);
+const genericItalicPreview = renderPreviewHtml(`![a](https://i/generic.png)
+*这是普通斜体文字*`);
+check(
+  '非图号斜体不成为媒体图注',
+  genericItalicPreview.includes('<p class="xp-p"><em>这是普通斜体文字</em></p>') && !genericItalicPreview.includes('xp-caption'),
+);
+
 // HTML 转义
 const xss = renderPreviewHtml('正文有 <script>alert(1)</script> 与 "引号"');
 check('文本经转义（无裸 <script>）', !xss.includes('<script>') && xss.includes('&lt;script&gt;'));

@@ -53,15 +53,23 @@ export function renderModelHtml(model: PreviewModel, opts: RenderPreviewOptions 
   if (isEmptyBody(model.blocks)) {
     parts.push(`<div class="xp-empty">（正文为空）</div>`);
   } else {
+    let previousBlock: ContentBlock | undefined;
     for (const group of groupBlocks(model.blocks)) {
       if (group.kind === 'list') {
         const tag = group.ordered ? 'ol' : 'ul';
         const cls = group.ordered ? 'xp-ol' : 'xp-ul';
         const items = group.items.map((b) => `<li>${renderInline(b, model.entities)}</li>`).join('');
         parts.push(`<${tag} class="${cls}">${items}</${tag}>`);
+        previousBlock = group.items[group.items.length - 1];
       } else {
-        const html = renderSingleBlock(group.block, model.entities, opts);
+        const html = renderSingleBlock(
+          group.block,
+          model.entities,
+          opts,
+          isMediaBlock(previousBlock, model.entities) && isImageCaption(group.block),
+        );
         if (html) parts.push(html);
+        previousBlock = group.block;
       }
     }
   }
@@ -78,10 +86,11 @@ function renderSingleBlock(
   block: ContentBlock,
   entities: Map<number, EntityValue>,
   opts: RenderPreviewOptions,
+  isCaption = false,
 ): string {
   switch (block.type) {
     case 'unstyled':
-      return `<p class="xp-p">${renderInline(block, entities)}</p>`;
+      return `<p class="${isCaption ? 'xp-caption' : 'xp-p'}">${renderInline(block, entities)}</p>`;
     case 'header-one': // X 编辑器的 Heading（markdown ##）
       return `<h2 class="xp-h1">${renderInline(block, entities)}</h2>`;
     case 'header-two': // X 编辑器的 SubHeading（markdown ### 及更深）
@@ -98,6 +107,21 @@ function renderSingleBlock(
     default:
       return assertNever(block.type, 'preview block type');
   }
+}
+
+function isMediaBlock(block: ContentBlock | undefined, entities: Map<number, EntityValue>): boolean {
+  const key = block?.entity_ranges[0]?.key;
+  return key !== undefined && entities.get(key)?.type === 'MEDIA';
+}
+
+function isImageCaption(block: ContentBlock): boolean {
+  return (
+    block.type === 'unstyled' &&
+    /^图 \d+｜/.test(block.text) &&
+    block.inline_style_ranges.some(
+      (range) => range.style === 'Italic' && range.offset === 0 && range.length === block.text.length,
+    )
+  );
 }
 
 function renderAtomic(
