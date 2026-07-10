@@ -110,7 +110,7 @@ Draft routes are namespaced by `kind` (`/:kind/drafts...`): the path segment is 
 | `GET` | `/:kind/drafts/:id` | — | `200` `DraftBundle` (outbox, then sent) | `401`, `404` (also for cross-kind access) |
 | `GET` | `/:kind/drafts/:id/assets/:fileName` | — | `200` binary (`application/octet-stream`) | `400` (illegal file name), `401`, `404` |
 | `PUT` | `/:kind/drafts/:id/cover` | `SetCoverWireBody` (JSON) | `200` updated `DraftBundle` | `400`, `401`, `404` |
-| `PATCH` | `/:kind/drafts/:id` | `{ status, restId?, error? }` | `200` updated `DraftBundle`; `done` moves it to `sent/` | `400`, `401`, `404` |
+| `PATCH` | `/:kind/drafts/:id` | `DraftAckPatch` | `200` updated `DraftBundle`; `done` moves it to `sent/` | `400`, `401`, `404` |
 | `DELETE` | `/:kind/drafts/:id` | — | `200` `{ deleted: true }` | `401`, `404` `{ deleted: false }` |
 
 `OPTIONS` preflight always answers `204`. Unhandled errors answer `500` `{ error }`.
@@ -121,7 +121,7 @@ The `POST /:kind/drafts` body is a single JSON document — no multipart, so the
 
 ```ts
 export interface PostDraftWireBody {
-  bundle: Omit<DraftBundle, 'status' | 'restId' | 'error'>;
+  bundle: Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>;
   assets: Array<{ fileName: string; mime: string; base64: string }>;
 }
 ```
@@ -169,7 +169,7 @@ All draft methods hit `/:kind/drafts...` for the client's kind scope:
 | `getDraft(id)` | `DraftBundle` | `GET /:kind/drafts/:id`. |
 | `getAsset(id, fileName)` | `Uint8Array` | `GET /:kind/drafts/:id/assets/:fileName` as binary. |
 | `setCover(id, cover)` | `void` | `PUT /:kind/drafts/:id/cover` with `SetCoverWireBody` (set or replace the cover). |
-| `ack(id, patch)` | `void` | `PATCH /:kind/drafts/:id` with `{ status, restId?, error? }`. |
+| `ack(id, patch)` | `void` | `PATCH /:kind/drafts/:id` with a `DraftAckPatch`. |
 | `deleteDraft(id)` | `void` | `DELETE /:kind/drafts/:id`. |
 
 On any non-2xx response every method throws `RelayHttpError`, which carries `method`, `url`, `status`, and (when available) the response `body` — so consumers can branch programmatically, e.g. `401` → prompt for a token.
@@ -247,12 +247,22 @@ for (const item of pending) {
       // upload bytes somewhere, map asset.src -> uploaded media id ...
     }
     // ... render bundle.markdown, create the draft, then:
-    await relay.ack(bundle.id, { status: 'done', restId: '1234567890' });
+    await relay.ack(bundle.id, {
+      status: 'done',
+      targetHandle: '@account_name',
+      restId: '1234567890',
+      editUrl: 'https://x.com/compose/articles/edit/1234567890',
+    });
   } catch (err) {
     await relay.ack(bundle.id, { status: 'failed', error: String(err) });
   }
 }
 ```
+
+`done` is a strict terminal result: `targetHandle`, `restId`, and the exact canonical
+`editUrl` are all required, and `editUrl` must equal
+`https://x.com/compose/articles/edit/${restId}`. Other statuses reject those terminal
+fields; retrying with `pending`, `uploading`, or `failed` clears any stale terminal result.
 
 Kind filtering happens server-side now. When you do read `kind` off a bundle or list item, use the canonical accessor `draftKind(b)` — absence (possible only on legacy disk bundles) still means `'x-article'`.
 

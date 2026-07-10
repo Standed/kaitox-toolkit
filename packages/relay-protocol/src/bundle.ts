@@ -39,7 +39,7 @@ export type DraftStatus = 'pending' | 'uploading' | 'done' | 'failed';
 /** Status update reported by a draft consumer. */
 export type DraftAckPatch =
   | { status: 'pending' | 'uploading' | 'failed'; error?: string }
-  | { status: 'done'; restId: string; editUrl: string; error?: never };
+  | { status: 'done'; targetHandle: string; restId: string; editUrl: string; error?: never };
 
 /** 风格检查的一条问题。 */
 export interface StyleIssue {

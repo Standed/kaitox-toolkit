@@ -47,6 +47,19 @@ export function readCt0(): string {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
+/** Read the active X account from the profile navigation/account switcher. */
+export function readTargetHandle(): string {
+  const href = document
+    .querySelector<HTMLAnchorElement>('a[data-testid="AppTabBar_Profile_Link"]')
+    ?.getAttribute('href');
+  const profileMatch = href?.match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
+  if (profileMatch) return `@${profileMatch[1]}`;
+
+  const switcherText = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]')?.textContent ?? '';
+  const switcherMatch = switcherText.match(/@([A-Za-z0-9_]{1,15})\b/);
+  return switcherMatch ? `@${switcherMatch[1]}` : '';
+}
+
 export async function getRelayClient(): Promise<HttpRelayClient> {
   const { relayBase, token } = await getSettings();
   return new HttpRelayClient(relayBase, { token, fetchImpl: window.fetch.bind(window) });

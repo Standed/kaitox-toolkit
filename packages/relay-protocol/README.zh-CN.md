@@ -110,7 +110,7 @@ Base URL 默认为 `http://127.0.0.1:8765`（以 `DEFAULT_RELAY_BASE` / `DEFAULT
 | `GET` | `/:kind/drafts/:id` | — | `200` `DraftBundle`（先查 outbox，再查 sent） | `401`、`404`（跨 kind 访问同样 404） |
 | `GET` | `/:kind/drafts/:id/assets/:fileName` | — | `200` 二进制（`application/octet-stream`） | `400`（非法文件名）、`401`、`404` |
 | `PUT` | `/:kind/drafts/:id/cover` | `SetCoverWireBody`（JSON） | `200` 更新后的 `DraftBundle` | `400`、`401`、`404` |
-| `PATCH` | `/:kind/drafts/:id` | `{ status, restId?, error? }` | `200` 更新后的 `DraftBundle`；`done` 会把它移到 `sent/` | `400`、`401`、`404` |
+| `PATCH` | `/:kind/drafts/:id` | `DraftAckPatch` | `200` 更新后的 `DraftBundle`；`done` 会把它移到 `sent/` | `400`、`401`、`404` |
 | `DELETE` | `/:kind/drafts/:id` | — | `200` `{ deleted: true }` | `401`、`404` `{ deleted: false }` |
 
 `OPTIONS` 预检恒应答 `204`。未处理的错误应答 `500` `{ error }`。
@@ -121,7 +121,7 @@ Base URL 默认为 `http://127.0.0.1:8765`（以 `DEFAULT_RELAY_BASE` / `DEFAULT
 
 ```ts
 export interface PostDraftWireBody {
-  bundle: Omit<DraftBundle, 'status' | 'restId' | 'error'>;
+  bundle: Omit<DraftBundle, 'status' | 'targetHandle' | 'restId' | 'editUrl' | 'error'>;
   assets: Array<{ fileName: string; mime: string; base64: string }>;
 }
 ```
@@ -169,7 +169,7 @@ new HttpRelayClient(baseUrl?, opts?)
 | `getDraft(id)` | `DraftBundle` | `GET /:kind/drafts/:id`。 |
 | `getAsset(id, fileName)` | `Uint8Array` | 以二进制获取 `GET /:kind/drafts/:id/assets/:fileName`。 |
 | `setCover(id, cover)` | `void` | 以 `SetCoverWireBody` 调 `PUT /:kind/drafts/:id/cover`（设置或替换封面）。 |
-| `ack(id, patch)` | `void` | 以 `{ status, restId?, error? }` 调 `PATCH /:kind/drafts/:id`。 |
+| `ack(id, patch)` | `void` | 以 `DraftAckPatch` 调 `PATCH /:kind/drafts/:id`。 |
 | `deleteDraft(id)` | `void` | `DELETE /:kind/drafts/:id`。 |
 
 任何非 2xx 响应都会使方法抛出 `RelayHttpError`，它携带 `method`、`url`、`status` 以及（若可得）响应 `body`——消费方可按状态码程序化分支，如 `401` → 提示配置 token。
@@ -247,12 +247,21 @@ for (const item of pending) {
       // upload bytes somewhere, map asset.src -> uploaded media id ...
     }
     // ... render bundle.markdown, create the draft, then:
-    await relay.ack(bundle.id, { status: 'done', restId: '1234567890' });
+    await relay.ack(bundle.id, {
+      status: 'done',
+      targetHandle: '@account_name',
+      restId: '1234567890',
+      editUrl: 'https://x.com/compose/articles/edit/1234567890',
+    });
   } catch (err) {
     await relay.ack(bundle.id, { status: 'failed', error: String(err) });
   }
 }
 ```
+
+`done` 是严格的终态结果：必须同时提供 `targetHandle`、`restId` 和精确的规范
+`editUrl`，且 `editUrl` 必须等于 `https://x.com/compose/articles/edit/${restId}`。
+其他状态不接受这些终态字段；以 `pending`、`uploading` 或 `failed` 重试时，会清除旧的终态结果。
 
 kind 过滤如今发生在服务端。当你确实要从 bundle 或列表项上读 `kind` 时，请用规范访问器 `draftKind(b)`——缺省（只可能出现在遗留磁盘草稿包上）仍意味着 `'x-article'`。
 

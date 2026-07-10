@@ -6,7 +6,7 @@
  *
  * 用法：npm run test:integration（需先 npm run build）
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -195,8 +195,43 @@ try {
   const idxCover = calls.findIndex((c) => c.url.includes('/ArticleEntityUpdateCoverMedia'));
   check('先建草稿再设封面', idxCreate >= 0 && idxCover > idxCreate);
 
+  // 重试必须清掉旧错误；done 必须持久化可核验的账号与精确编辑地址。
+  await client.ack(id, { status: 'failed', error: 'stale upload failure' });
+  const staleBundlePath = join(home, 'x-article', 'outbox', id, 'bundle.json');
+  const staleBundle = JSON.parse(await readFile(staleBundlePath, 'utf8'));
+  Object.assign(staleBundle, {
+    targetHandle: '@stale_account',
+    restId: 'STALE_REST_ID',
+    editUrl: 'https://x.com/compose/articles/edit/STALE_REST_ID',
+  });
+  await writeFile(staleBundlePath, JSON.stringify(staleBundle, null, 2), 'utf8');
+  await client.ack(id, { status: 'uploading' });
+  const retrying = await client.getDraft(id);
+  check(
+    'failed → uploading 清掉 stale terminal state',
+    retrying.status === 'uploading' &&
+      retrying.error === undefined &&
+      retrying.targetHandle === undefined &&
+      retrying.restId === undefined &&
+      retrying.editUrl === undefined,
+  );
+  const editUrl = 'https://x.com/compose/articles/edit/ART_777';
+  await client.ack(id, {
+    status: 'done',
+    targetHandle: '@aaxiaoshi666',
+    restId: 'ART_777',
+    editUrl,
+  });
+  const doneDraft = await client.getDraft(id);
+  check(
+    'done 持久化 targetHandle + restId + exact editUrl 且无 stale error',
+    doneDraft.status === 'done' &&
+      doneDraft.targetHandle === '@aaxiaoshi666' &&
+      doneDraft.restId === 'ART_777' &&
+      doneDraft.editUrl === editUrl &&
+      doneDraft.error === undefined,
+  );
   // done → sent（迁移目录归档，但列表仍要能看到——草稿箱「已上传」Tab 依赖）
-  await client.ack(id, { status: 'done', restId: 'ART_777' });
   const doneItem = (await client.listDrafts()).find((d) => d.id === id);
   check('done 后仍在列表且 status=done', doneItem?.status === 'done');
   check('done 迁移后原图资产仍可读', (await client.getAsset(id, 'cover-original-orig.png')).length === pngBytes.length);

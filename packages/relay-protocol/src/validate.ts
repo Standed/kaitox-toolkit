@@ -151,6 +151,7 @@ export function validateAckPatch(input: unknown): WireResult<DraftAckPatch> {
     issues.push({ path: '$.status', message: `expected one of ${[...DRAFT_STATUSES].join(' | ')}` });
   }
   if (input.status === 'done') {
+    pushStr(input.targetHandle, '$.targetHandle', issues);
     pushStr(input.restId, '$.restId', issues);
     pushStr(input.editUrl, '$.editUrl', issues);
     if (
@@ -162,6 +163,9 @@ export function validateAckPatch(input: unknown): WireResult<DraftAckPatch> {
     }
     if (input.error !== undefined) issues.push({ path: '$.error', message: 'not allowed when status is done' });
   } else {
+    if (input.targetHandle !== undefined) {
+      issues.push({ path: '$.targetHandle', message: 'only allowed when status is done' });
+    }
     if (input.restId !== undefined) issues.push({ path: '$.restId', message: 'only allowed when status is done' });
     if (input.editUrl !== undefined) issues.push({ path: '$.editUrl', message: 'only allowed when status is done' });
     if (input.error !== undefined) pushStr(input.error, '$.error', issues, true);

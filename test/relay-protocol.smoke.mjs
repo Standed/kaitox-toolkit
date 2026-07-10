@@ -138,6 +138,7 @@ try {
   // ack
   await client.ack(id, {
     status: 'done',
+    targetHandle: '@aaxiaoshi666',
     restId: 'R_1',
     editUrl: 'https://x.com/compose/articles/edit/R_1',
   });
@@ -145,6 +146,7 @@ try {
   check(
     'ack persists verified result',
     done.status === 'done' &&
+      done.targetHandle === '@aaxiaoshi666' &&
       done.restId === 'R_1' &&
       done.editUrl === 'https://x.com/compose/articles/edit/R_1',
   );

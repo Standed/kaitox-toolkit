@@ -11,7 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } f
 import { createPortal } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import type { DraftListItem, DraftStatus, HttpRelayClient, StyleReport } from '@kaitox/relay-protocol';
-import { getRelayClient, getSettings } from './xsession.js';
+import { getRelayClient, getSettings, readTargetHandle } from './xsession.js';
 import { uploadDraft } from './uploader.js';
 import { LOGO_SVG } from './logo.js';
 import {
@@ -293,25 +293,21 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
       setTab('uploading');
       setPage(1);
       try {
+        const targetHandle = readTargetHandle();
+        if (!targetHandle) throw new Error('无法确认当前登录的 X 账号，请刷新页面后重试。');
         await client.ack(id, { status: 'uploading' });
         const bundle = await client.getDraft(id);
         bundles.seed(bundle);
         const result = await uploadDraft(bundle, client, (message) => {
           setUploads((u) => ({ ...u, [id]: { phase: 'uploading', message } }));
         });
-        await client.ack(id, { status: 'done', restId: result.restId });
+        if (!result.restId) throw new Error('草稿已创建，但未取到 rest_id，未写入成功状态。');
+        const editUrl = `https://x.com/compose/articles/edit/${result.restId}`;
+        await client.ack(id, { status: 'done', targetHandle, restId: result.restId, editUrl });
 
         const skipped = result.skippedImages.length ? `（跳过 ${result.skippedImages.length} 张图）` : '';
-        if (result.restId) {
-          setUploads((u) => ({ ...u, [id]: { phase: 'success', message: `已创建草稿${skipped}，正在打开…` } }));
-          setTimeout(() => location.assign(`/compose/articles/edit/${result.restId}`), 600);
-        } else {
-          setUploads((u) => ({
-            ...u,
-            [id]: { phase: 'success', message: `已创建草稿${skipped}（未取到 rest_id，请到文章列表查看）。` },
-          }));
-          void refresh();
-        }
+        setUploads((u) => ({ ...u, [id]: { phase: 'success', message: `已创建草稿${skipped}，正在打开…` } }));
+        setTimeout(() => location.assign(editUrl), 600);
       } catch (err: any) {
         const msg = err?.message ?? String(err);
         await client.ack(id, { status: 'failed', error: msg }).catch(() => {});

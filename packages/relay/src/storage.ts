@@ -202,8 +202,22 @@ export async function patchDraft(
   const b = await readBundleFrom(dir);
   if (!b) return null;
   const updated: DraftBundle = patch.status === 'done'
-    ? { ...b, status: 'done', restId: patch.restId, editUrl: patch.editUrl, error: undefined }
-    : { ...b, status: patch.status, error: patch.error, restId: undefined, editUrl: undefined };
+    ? {
+        ...b,
+        status: 'done',
+        targetHandle: patch.targetHandle,
+        restId: patch.restId,
+        editUrl: patch.editUrl,
+        error: undefined,
+      }
+    : {
+        ...b,
+        status: patch.status,
+        error: patch.error,
+        targetHandle: undefined,
+        restId: undefined,
+        editUrl: undefined,
+      };
   await writeFile(join(dir, BUNDLE_FILE), JSON.stringify(updated, null, 2), 'utf8');
   if (patch.status === 'done') {
     const dest = draftDir(kind, safe, true);
