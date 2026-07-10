@@ -8,6 +8,8 @@
  * 用法：npm run test:integration（需先 npm run build）
  */
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { build as buildTestModule } from 'esbuild';
@@ -57,6 +59,53 @@ const xsessionBuild = await buildTestModule({
 });
 const xsessionModuleUrl = `data:text/javascript;base64,${Buffer.from(xsessionBuild.outputFiles[0].contents).toString('base64')}`;
 
+const contentOsProtocolBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/content-os-protocol.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const contentOsProtocolModuleUrl = `data:text/javascript;base64,${Buffer.from(contentOsProtocolBuild.outputFiles[0].contents).toString('base64')}`;
+const {
+  CONTENT_OS_ORIGIN,
+  CONTENT_OS_INBOUND_SOURCE,
+  CONTENT_OS_OUTBOUND_SOURCE,
+  MAX_HANDOFF_IMAGE_BYTES,
+  MAX_HANDOFF_MEDIA,
+  validateHandoff,
+} = await import(contentOsProtocolModuleUrl);
+
+const contentOsContentBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/content-os-content.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const contentOsContentModuleUrl = `data:text/javascript;base64,${Buffer.from(contentOsContentBuild.outputFiles[0].contents).toString('base64')}`;
+const {
+  handleContentOsPageMessage,
+  normalizeContentOsRuntimeResponse,
+} = await import(contentOsContentModuleUrl);
+
+const contentOsBackgroundBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/content-os-background.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const contentOsBackgroundModuleUrl = `data:text/javascript;base64,${Buffer.from(contentOsBackgroundBuild.outputFiles[0].contents).toString('base64')}`;
+const {
+  contentOsDraftStatus,
+  enqueueContentOsHandoff,
+  handleContentOsRuntimeMessage,
+} = await import(contentOsBackgroundModuleUrl);
+
 const BASE = 'http://127.0.0.1:8788';
 let pass = 0,
   fail = 0;
@@ -95,6 +144,258 @@ const allQueryIds = (prefix) => ({
   ArticleEntityUpdateContent: `${prefix}_CONTENT`,
   ArticleEntityUpdateCoverMedia: `${prefix}_COVER`,
 });
+
+// ---- -1. Content OS handoff protocol ----
+console.log('\n[-1] Content OS handoff protocol validation');
+const handoffNow = Date.parse('2026-07-10T04:00:00.000Z');
+const handoffBytes = Uint8Array.from([1, 2, 3, 4]);
+const handoffSha = createHash('sha256').update(handoffBytes).digest('hex');
+const makeHandoffAsset = (index, overrides = {}) => ({
+  key: `x-article-media/media-${index}.png`,
+  src: `https://media.aizao.ai/x-article-media/media-${index}.png`,
+  fileName: `media-${index}.png`,
+  mime: 'image/png',
+  bytesLen: handoffBytes.byteLength,
+  sha256: handoffSha,
+  ...overrides,
+});
+const makeHandoffAssets = (count) => Array.from({ length: count }, (_, index) => makeHandoffAsset(index + 1));
+const validHandoffAssets = makeHandoffAssets(2);
+const validHandoff = {
+  schemaVersion: 1,
+  handoffId: 'handoff-task-6',
+  title: 'Task 6 bridge',
+  markdown: validHandoffAssets.map((asset, index) => `![image ${index + 1}](${asset.src})`).join('\n\n'),
+  targetHandle: 'aaxiaoshi666',
+  assets: validHandoffAssets,
+  cover: makeHandoffAsset('cover', {
+    key: 'x-article-cover/cover-5x2.png',
+    src: 'https://media.aizao.ai/x-article-cover/cover-5x2.png',
+    fileName: 'cover-5x2.png',
+  }),
+  mediaMap: validHandoffAssets.map((_, assetIndex) => ({
+    assetIndex,
+    figureIds: [`figure-${assetIndex + 1}`],
+    sourceIndexes: [assetIndex],
+    cellLabels: [],
+  })),
+  source: 'content-os',
+  createdAt: '2026-07-10T03:30:00.000Z',
+  expiresAt: '2026-07-10T04:30:00.000Z',
+};
+const handoffOk = (manifest) => validateHandoff(manifest, { now: () => handoffNow }).ok;
+check('Content OS exact origin constant is locked', CONTENT_OS_ORIGIN === 'https://aizao.ai');
+check('valid Content OS handoff passes', handoffOk(validHandoff));
+check('wrong target handle is rejected', !handoffOk({ ...validHandoff, targetHandle: 'other' }));
+check('more than 25 body media are rejected', MAX_HANDOFF_MEDIA === 25 && !handoffOk({
+  ...validHandoff,
+  assets: makeHandoffAssets(26),
+}));
+check('an image at 5 MiB is rejected', MAX_HANDOFF_IMAGE_BYTES === 5 * 1024 * 1024 && !handoffOk({
+  ...validHandoff,
+  assets: [{ ...validHandoff.assets[0], bytesLen: 5 * 1024 * 1024 }],
+  markdown: `![image](${validHandoff.assets[0].src})`,
+  mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
+}));
+check('non-allowlisted media host is rejected', !handoffOk({
+  ...validHandoff,
+  assets: [{ ...validHandoff.assets[0], src: 'https://evil.example/a.png' }],
+  markdown: '![image](https://evil.example/a.png)',
+  mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
+}));
+check('expired manifest is rejected', !handoffOk({ ...validHandoff, expiresAt: '2026-07-09T00:00:00.000Z' }));
+check('Markdown image order must exactly match assets', !handoffOk({
+  ...validHandoff,
+  markdown: [...validHandoffAssets].reverse().map((asset) => `![](${asset.src})`).join('\n'),
+}));
+check('asset file names cannot contain paths', !handoffOk({
+  ...validHandoff,
+  assets: [{ ...validHandoff.assets[0], fileName: '../a.png' }],
+  markdown: `![image](${validHandoff.assets[0].src})`,
+  mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
+}));
+
+// ---- -0.5. Content OS page/background bridge ----
+console.log('\n[-0.5] Content OS exact-origin page/background bridge');
+const pagePosts = [];
+const forwardedRequests = [];
+const pageWindow = {
+  postMessage(message, targetOrigin) {
+    pagePosts.push({ message, targetOrigin });
+  },
+};
+const sendRuntimeMessage = async (message) => {
+  forwardedRequests.push(message);
+  if (message.type === 'KAITOX_PING') {
+    return { available: true, draftOnly: true, relayToken: 'must-not-cross-page-boundary' };
+  }
+  if (message.type === 'KAITOX_ENQUEUE') return { draftId: 'draft-content-os-1', extra: 'drop-me' };
+  return {
+    status: 'done',
+    restId: 'rest-content-os-1',
+    editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
+    targetHandle: '@aaxiaoshi666',
+  };
+};
+const pingRequest = {
+  source: CONTENT_OS_OUTBOUND_SOURCE,
+  requestId: 'request-ping-1',
+  type: 'KAITOX_PING',
+  xCredentials: { cookie: 'must-not-cross-extension-boundary' },
+};
+await handleContentOsPageMessage({
+  source: pageWindow,
+  origin: 'https://evil.example',
+  data: pingRequest,
+}, { pageWindow, sendRuntimeMessage });
+await handleContentOsPageMessage({
+  source: {},
+  origin: CONTENT_OS_ORIGIN,
+  data: pingRequest,
+}, { pageWindow, sendRuntimeMessage });
+await handleContentOsPageMessage({
+  source: pageWindow,
+  origin: CONTENT_OS_ORIGIN,
+  data: { ...pingRequest, source: 'other-page' },
+}, { pageWindow, sendRuntimeMessage });
+check('wrong origin/window/source messages are ignored', forwardedRequests.length === 0 && pagePosts.length === 0);
+
+await handleContentOsPageMessage({
+  source: pageWindow,
+  origin: CONTENT_OS_ORIGIN,
+  data: pingRequest,
+}, { pageWindow, sendRuntimeMessage });
+check('trusted page request is forwarded once with unknown fields removed',
+  forwardedRequests.length === 1 &&
+  JSON.stringify(forwardedRequests[0]) === JSON.stringify({
+    source: CONTENT_OS_OUTBOUND_SOURCE,
+    requestId: pingRequest.requestId,
+    type: 'KAITOX_PING',
+  }));
+check('reply preserves exact request id and exact target origin',
+  pagePosts.length === 1 &&
+  pagePosts[0].targetOrigin === CONTENT_OS_ORIGIN &&
+  pagePosts[0].message.source === CONTENT_OS_INBOUND_SOURCE &&
+  pagePosts[0].message.requestId === pingRequest.requestId);
+check('page reply exposes only ping status, never relay credentials',
+  JSON.stringify(pagePosts[0].message) === JSON.stringify({
+    source: CONTENT_OS_INBOUND_SOURCE,
+    requestId: pingRequest.requestId,
+    available: true,
+    draftOnly: true,
+  }));
+check('malformed done status is rejected by the page bridge',
+  normalizeContentOsRuntimeResponse('KAITOX_STATUS', {
+    status: 'done',
+    restId: 'rest-1',
+    editUrl: 'https://x.com/compose/articles/edit/other',
+  }).error === 'Kaitox 返回了无效草稿状态');
+
+const backgroundAssets = makeHandoffAssets(4);
+const backgroundManifest = {
+  ...validHandoff,
+  assets: backgroundAssets,
+  markdown: backgroundAssets.map((asset) => `![](${asset.src})`).join('\n'),
+  mediaMap: backgroundAssets.map((_, assetIndex) => ({
+    assetIndex,
+    figureIds: [`figure-${assetIndex + 1}`],
+    sourceIndexes: [assetIndex],
+    cellLabels: [],
+  })),
+};
+let activeHandoffDownloads = 0;
+let maxActiveHandoffDownloads = 0;
+const handoffFetches = [];
+const postDraftInputs = [];
+const storedAutoUpload = [];
+const openedTabs = [];
+const backgroundClient = {
+  async postDraft(input) {
+    postDraftInputs.push(input);
+    return { id: 'draft-content-os-1' };
+  },
+  async getDraft(draftId) {
+    return {
+      id: draftId,
+      source: 'content-os',
+      status: 'done',
+      restId: 'rest-content-os-1',
+      editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
+      targetHandle: '@aaxiaoshi666',
+      markdown: 'secret body must not cross status',
+    };
+  },
+};
+const backgroundDeps = {
+  now: () => handoffNow,
+  getClient: async () => backgroundClient,
+  fetchImpl: async (url, init) => {
+    handoffFetches.push({ url, init });
+    activeHandoffDownloads++;
+    maxActiveHandoffDownloads = Math.max(maxActiveHandoffDownloads, activeHandoffDownloads);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeHandoffDownloads--;
+    return new Response(handoffBytes, { status: 200, headers: { 'content-type': 'image/png' } });
+  },
+  storageLocal: {
+    async set(value) { storedAutoUpload.push(value); },
+  },
+  tabs: {
+    async create(value) { openedTabs.push(value); },
+  },
+};
+const enqueueResult = await enqueueContentOsHandoff(backgroundManifest, backgroundDeps);
+check('enqueue returns the local relay draft id', enqueueResult.draftId === 'draft-content-os-1');
+check('media downloads use concurrency 3', handoffFetches.length === 5 && maxActiveHandoffDownloads === 3);
+check('media downloads omit credentials and reject redirects', handoffFetches.every(({ init }) =>
+  init?.credentials === 'omit' && init?.redirect === 'error'));
+check('relay bundle preserves exact body src and verified local bytes',
+  postDraftInputs.length === 1 &&
+  postDraftInputs[0].source === 'content-os' &&
+  postDraftInputs[0].sourceMeta.handoffId === backgroundManifest.handoffId &&
+  postDraftInputs[0].sourceMeta.targetHandle === backgroundManifest.targetHandle &&
+  postDraftInputs[0].assets.every((asset, index) =>
+    asset.src === backgroundManifest.assets[index].src && asset.bytes.byteLength === handoffBytes.byteLength));
+check('cover becomes the relay cover sentinel',
+  postDraftInputs[0].cover.src === '__cover__' &&
+  postDraftInputs[0].cover.bytes.byteLength === handoffBytes.byteLength);
+check('auto-upload id is stored before opening only the X Articles composer',
+  storedAutoUpload[0]?.kaitoxAutoUploadDraftId === 'draft-content-os-1' &&
+  openedTabs.length === 1 && openedTabs[0].url === 'https://x.com/compose/articles');
+
+const safeStatus = await contentOsDraftStatus('draft-content-os-1', backgroundDeps);
+check('status response is strict and omits body/account/credential-adjacent fields',
+  JSON.stringify(safeStatus) === JSON.stringify({
+    status: 'done',
+    restId: 'rest-content-os-1',
+    editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
+  }));
+check('background rejects runtime messages from non-Content-OS senders',
+  await handleContentOsRuntimeMessage(pingRequest, { url: 'https://evil.example/writing' }, backgroundDeps) === undefined);
+check('background ping is draft-only and credential-free',
+  JSON.stringify(await handleContentOsRuntimeMessage(
+    pingRequest,
+    { url: 'https://aizao.ai/writing/123' },
+    backgroundDeps,
+  )) === JSON.stringify({ available: true, draftOnly: true }));
+
+let integrityPostCount = 0;
+await assert.rejects(
+  () => enqueueContentOsHandoff({
+    ...validHandoff,
+    assets: [{ ...validHandoff.assets[0], sha256: '0'.repeat(64) }],
+    markdown: `![](${validHandoff.assets[0].src})`,
+    mediaMap: [{ assetIndex: 0, figureIds: ['figure-1'], sourceIndexes: [0], cellLabels: [] }],
+    cover: undefined,
+  }, {
+    ...backgroundDeps,
+    getClient: async () => ({
+      async postDraft() { integrityPostCount++; return { id: 'must-not-exist' }; },
+    }),
+  }),
+  /图片哈希校验失败/,
+);
+check('integrity failure prevents relay enqueue', integrityPostCount === 0);
 
 // ---- 0. X 前端 queryId 动态发现 ----
 console.log('\n[0] X 前端 queryId 发现 + 缓存 + 单次刷新');

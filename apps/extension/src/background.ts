@@ -1,5 +1,8 @@
 /** service worker：可选的角标计数，显示 relay 里有几份待上传草稿。 */
 import { DEFAULT_RELAY_BASE } from './xsession.js';
+import { registerContentOsBackgroundHandlers } from './content-os-background.js';
+
+registerContentOsBackgroundHandlers();
 
 // 点工具栏图标：任意页面弹出右侧设置浮窗。
 // 1) 页面里已有脚本（x.com 文章页常驻，或此前注入过）→ 发消息开/关；

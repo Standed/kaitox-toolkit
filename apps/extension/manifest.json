@@ -8,6 +8,8 @@
     "*://x.com/*",
     "*://upload.x.com/*",
     "*://twitter.com/*",
+    "https://aizao.ai/*",
+    "https://media.aizao.ai/*",
     "http://127.0.0.1:8765/*",
     "http://localhost:8765/*"
   ],
@@ -22,6 +24,11 @@
       ],
       "js": ["content.js"],
       "css": ["panel.css", "preview.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://aizao.ai/writing*"],
+      "js": ["content-os-content.js"],
       "run_at": "document_idle"
     }
   ],

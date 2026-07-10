@@ -23,6 +23,7 @@ const common = {
 await mkdir('dist', { recursive: true });
 
 await esbuild.build({ ...common, entryPoints: ['src/content.ts'], outfile: 'dist/content.js' });
+await esbuild.build({ ...common, entryPoints: ['src/content-os-content.ts'], outfile: 'dist/content-os-content.js' });
 await esbuild.build({ ...common, entryPoints: ['src/background.ts'], outfile: 'dist/background.js' });
 // mermaid 单独出 ESM 包，content.js 里动态 import() 懒加载（见 mermaid-render.ts）。
 await esbuild.build({ ...common, format: 'esm', entryPoints: ['src/mermaid-lib.ts'], outfile: 'dist/mermaid-lib.js' });
@@ -36,6 +37,17 @@ const manifest = JSON.parse(await readFile('manifest.json', 'utf8'));
 const pkg = JSON.parse(await readFile('package.json', 'utf8'));
 if (!(manifest.host_permissions ?? []).some((p) => p.includes(`:${DEFAULT_RELAY_PORT}/`))) {
   throw new Error(`manifest.json host_permissions 缺少默认 relay 端口 ${DEFAULT_RELAY_PORT} 的条目（与 @kaitox/relay-protocol 的 DEFAULT_RELAY_PORT 不一致）`);
+}
+for (const permission of ['https://aizao.ai/*', 'https://media.aizao.ai/*']) {
+  if (!(manifest.host_permissions ?? []).includes(permission)) {
+    throw new Error(`manifest.json host_permissions 缺少 ${permission}`);
+  }
+}
+const contentOsScripts = (manifest.content_scripts ?? []).filter((entry) =>
+  (entry.js ?? []).includes('content-os-content.js'));
+if (contentOsScripts.length !== 1
+  || JSON.stringify(contentOsScripts[0].matches) !== JSON.stringify(['https://aizao.ai/writing*'])) {
+  throw new Error('manifest.json 必须只在 https://aizao.ai/writing* 注册 Content OS bridge');
 }
 manifest.version = pkg.version;
 await writeFile('dist/manifest.json', JSON.stringify(manifest, null, 2) + '\n');
