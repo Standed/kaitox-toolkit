@@ -37,6 +37,9 @@ export function outboxDir(kind: string): string {
 export function sentDir(kind: string): string {
   return join(kaitoxHome(), kind, 'sent');
 }
+export function idempotencyDir(kind: string): string {
+  return join(kaitoxHome(), kind, 'idempotency');
+}
 export function configPath(): string {
   return join(kaitoxHome(), 'config.json');
 }

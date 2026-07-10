@@ -20,7 +20,8 @@ process.env.KAITOX_HOME = home;
 process.env.KAITOX_RELAY_PORT = '8788';
 
 const { startRelay } = await import('@kaitox/relay');
-const { HttpRelayClient } = await import('@kaitox/relay-protocol');
+const { HttpRelayClient, RelayHttpError } = await import('@kaitox/relay-protocol');
+const { saveDraft } = await import('../packages/relay/dist/storage.js');
 const {
   publishXArticle,
   collectImageSources,
@@ -111,6 +112,11 @@ const {
   handleContentOsRuntimeMessage,
 } = await import(contentOsBackgroundModuleUrl);
 
+const compatibilityFixture = JSON.parse(await readFile(
+  new URL('./fixtures/content-os-kaitox-v1.json', import.meta.url),
+  'utf8',
+));
+
 const BASE = 'http://127.0.0.1:8788';
 let pass = 0,
   fail = 0;
@@ -191,6 +197,22 @@ const validHandoff = {
 const handoffOk = (manifest) => validateHandoff(manifest, { now: () => handoffNow }).ok;
 check('Content OS exact origin constant is locked', CONTENT_OS_ORIGIN === 'https://aizao.ai');
 check('valid Content OS handoff passes', handoffOk(validHandoff));
+check('cross-repo compatibility fixture is accepted by Kaitox', handoffOk(compatibilityFixture.manifest));
+check('cross-repo pending status preserves handoffId',
+  JSON.stringify(normalizeContentOsRuntimeResponse(
+    compatibilityFixture.statusRequest,
+    compatibilityFixture.pendingStatus,
+  )) === JSON.stringify(compatibilityFixture.pendingStatus));
+check('cross-repo done status preserves handoffId',
+  JSON.stringify(normalizeContentOsRuntimeResponse(
+    compatibilityFixture.statusRequest,
+    compatibilityFixture.doneStatus,
+  )) === JSON.stringify(compatibilityFixture.doneStatus));
+check('cross-repo structured public error stays bounded',
+  JSON.stringify(normalizeContentOsRuntimeResponse(
+    compatibilityFixture.statusRequest,
+    compatibilityFixture.errorResponse,
+  )) === JSON.stringify(compatibilityFixture.errorResponse));
 check('wrong target handle is rejected', !handoffOk({ ...validHandoff, targetHandle: 'other' }));
 check('the Content OS account is locked to @aaxiaoshi666', CONTENT_OS_TARGET_HANDLE === '@aaxiaoshi666');
 check('more than 25 body media are rejected', MAX_HANDOFF_MEDIA === 25 && !handoffOk({
@@ -262,6 +284,7 @@ const sendRuntimeMessage = async (message) => {
   }
   if (message.type === 'KAITOX_ENQUEUE') return { draftId: 'draft-content-os-1', extra: 'drop-me' };
   return {
+    handoffId: message.handoffId,
     status: 'done',
     restId: 'rest-content-os-1',
     editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
@@ -323,12 +346,13 @@ check('page reply exposes only ping status, never relay credentials',
     draftOnly: true,
   }));
 check('malformed done status is rejected by the page bridge',
-  normalizeContentOsRuntimeResponse('KAITOX_STATUS', {
+  normalizeContentOsRuntimeResponse(statusRequest, {
+    handoffId: statusRequest.handoffId,
     status: 'done',
     restId: 'rest-1',
     editUrl: 'https://x.com/compose/articles/edit/other',
   }).error.code === 'INVALID_RESPONSE');
-const redactedPublicError = normalizeContentOsRuntimeResponse('KAITOX_STATUS', {
+const redactedPublicError = normalizeContentOsRuntimeResponse(statusRequest, {
   error: { code: 'INTERNAL_ERROR', message: 'secret /Users/person token=abc' },
 });
 check('page errors are bounded code/message pairs with untrusted details removed',
@@ -337,7 +361,7 @@ check('page errors are bounded code/message pairs with untrusted details removed
   !JSON.stringify(redactedPublicError).includes('/Users/person') &&
   !JSON.stringify(redactedPublicError).includes('token=abc'));
 check('raw string errors are never forwarded to the page',
-  normalizeContentOsRuntimeResponse('KAITOX_STATUS', { error: 'relay /Users/person token=abc' }).error.code === 'INVALID_RESPONSE');
+  normalizeContentOsRuntimeResponse(statusRequest, { error: 'relay /Users/person token=abc' }).error.code === 'INVALID_RESPONSE');
 check('unknown internal exceptions map to one fixed public error',
   JSON.stringify(contentOsPublicError(new Error('relay /Users/person token=abc'))) === JSON.stringify({
     code: 'INTERNAL_ERROR',
@@ -440,6 +464,20 @@ await assert.rejects(
 );
 check('the same handoffId cannot be replayed with different content', postDraftInputs.length === 1);
 
+await assert.rejects(
+  () => enqueueContentOsHandoff({ ...backgroundManifest, handoffId: 'handoff-relay-conflict' }, {
+    ...backgroundDeps,
+    storageLocal: { async get() { return {}; }, async set() {} },
+    getClient: async () => ({
+      async postDraft() {
+        throw new RelayHttpError('POST', 'http://127.0.0.1:8765/x-article/drafts', 409);
+      },
+    }),
+  }),
+  (error) => error?.code === 'HANDOFF_REPLAY_CONFLICT',
+);
+check('relay idempotency conflicts preserve the bounded public conflict code', true);
+
 let corruptedReplayPostCount = 0;
 await assert.rejects(
   () => enqueueContentOsHandoff({ ...backgroundManifest, handoffId: 'handoff-corrupt-record' }, {
@@ -481,9 +519,39 @@ const concurrentResults = await Promise.all([
 check('concurrent duplicate handoffs share one relay enqueue',
   concurrentPostCount === 1 && concurrentResults.every(({ draftId }) => draftId === 'draft-concurrent'));
 
+let expiryNow = handoffNow;
+let expiredPostCount = 0;
+await assert.rejects(
+  () => enqueueContentOsHandoff({
+    ...backgroundManifest,
+    handoffId: 'handoff-expires-during-download',
+    expiresAt: new Date(handoffNow + 10).toISOString(),
+  }, {
+    ...backgroundDeps,
+    now: () => expiryNow,
+    fetchImpl: async () => {
+      expiryNow += 20;
+      return new Response(handoffBytes, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(handoffBytes.byteLength),
+        },
+      });
+    },
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
+    getClient: async () => ({
+      async postDraft() { expiredPostCount++; return { id: 'must-not-exist' }; },
+    }),
+  }),
+  (error) => error?.code === 'INVALID_HANDOFF',
+);
+check('expiry is rechecked immediately before relay post', expiredPostCount === 0);
+
 const safeStatus = await contentOsDraftStatus('draft-content-os-1', validHandoff.handoffId, backgroundDeps);
 check('status response is strict and omits body/account/credential-adjacent fields',
   JSON.stringify(safeStatus) === JSON.stringify({
+    handoffId: validHandoff.handoffId,
     status: 'done',
     restId: 'rest-content-os-1',
     editUrl: 'https://x.com/compose/articles/edit/rest-content-os-1',
@@ -1040,6 +1108,95 @@ try {
   check('自定义 kind 往返保留', (await demoClient.getDraft(kindId)).kind === 'demo-feature');
   check('跨 kind 隔离：x-article 列表不含 demo-feature', !(await client.listDrafts()).some((d) => d.id === kindId));
   await demoClient.deleteDraft(kindId);
+
+  const idempotentInput = {
+    title: 'Content OS idempotency', mode: 'rich', source: 'content-os', markdown: '', assets: [],
+    sourceMeta: {
+      handoffId: 'handoff-relay-idempotency',
+      handoffFingerprint: 'a'.repeat(64),
+      targetHandle: '@aaxiaoshi666',
+    },
+  };
+  const firstIdempotent = await client.postDraft(idempotentInput);
+  const replayedIdempotent = await client.postDraft(idempotentInput);
+  check('relay enqueue is idempotent on handoffId and fingerprint',
+    firstIdempotent.id === replayedIdempotent.id);
+  await assert.rejects(
+    () => client.postDraft({
+      ...idempotentInput,
+      sourceMeta: { ...idempotentInput.sourceMeta, handoffFingerprint: 'b'.repeat(64) },
+    }),
+    (error) => error?.status === 409,
+  );
+  check('relay rejects a conflicting fingerprint for the same handoffId', true);
+
+  const interruptedWire = {
+    bundle: {
+      schemaVersion: 1,
+      id: 'caller-generated-id-is-not-authoritative',
+      kind: 'x-article',
+      title: 'Interrupted Content OS enqueue',
+      markdown: '',
+      mode: 'rich',
+      assets: [],
+      createdAt: '2026-07-10T04:00:00.000Z',
+      source: 'content-os',
+      sourceMeta: {
+        handoffId: 'handoff-relay-interruption',
+        handoffFingerprint: 'c'.repeat(64),
+        targetHandle: '@aaxiaoshi666',
+      },
+    },
+    assets: [],
+  };
+  await assert.rejects(
+    () => saveDraft(interruptedWire, 'x-article', {
+      afterIdempotencyPrecommit() { throw new Error('simulated interruption'); },
+    }),
+    /simulated interruption/,
+  );
+  const recoveredId = await saveDraft(interruptedWire, 'x-article');
+  const replayedRecoveredId = await saveDraft(interruptedWire, 'x-article');
+  check('durable precommit reconciles an interrupted relay enqueue',
+    recoveredId === replayedRecoveredId && Boolean(await client.getDraft(recoveredId)));
+
+  let failExtensionStorage = true;
+  const recoveryTabs = [];
+  const recoveryStorage = {
+    values: {},
+    async get(key) { return { [key]: this.values[key] }; },
+    async set(value) {
+      if (failExtensionStorage) {
+        failExtensionStorage = false;
+        throw new Error('simulated extension storage failure');
+      }
+      Object.assign(this.values, value);
+    },
+  };
+  const recoveryDeps = {
+    now: () => handoffNow,
+    getClient: async () => client,
+    fetchImpl: async () => new Response(handoffBytes, {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(handoffBytes.byteLength),
+      },
+    }),
+    storageLocal: recoveryStorage,
+    tabs: { async create(value) { recoveryTabs.push(value); } },
+  };
+  await assert.rejects(
+    () => enqueueContentOsHandoff(compatibilityFixture.manifest, recoveryDeps),
+    /simulated extension storage failure/,
+  );
+  const recoveredEnqueue = await enqueueContentOsHandoff(compatibilityFixture.manifest, recoveryDeps);
+  const recoveredMatches = (await client.listDrafts()).filter((draft) =>
+    draft.title === compatibilityFixture.manifest.title);
+  check('relay identity closes the extension storage partial-failure window',
+    recoveredMatches.length === 1
+    && recoveredMatches[0].id === recoveredEnqueue.draftId
+    && recoveryTabs.length === 1);
   let traversalBlocked = false;
   try { await client.getAsset(id, '../../etc/passwd'); } catch { traversalBlocked = true; }
   check('目录穿越被拦', traversalBlocked);

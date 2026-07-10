@@ -44,6 +44,7 @@ import {
 } from './config.js';
 import {
   saveDraft,
+  IdempotencyConflictError,
   listDrafts,
   getDraft,
   getAssetPath,
@@ -231,7 +232,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: RelaySta
         });
         return;
       }
-      const id = await saveDraft(v.value, kind);
+      let id: string;
+      try {
+        id = await saveDraft(v.value, kind);
+      } catch (error) {
+        if (error instanceof IdempotencyConflictError) {
+          sendJson(req, res, 409, { error: 'handoff idempotency conflict' });
+          return;
+        }
+        throw error;
+      }
       sendJson(req, res, 201, { id });
       return;
     }

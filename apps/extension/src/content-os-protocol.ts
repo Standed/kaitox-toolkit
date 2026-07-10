@@ -98,9 +98,9 @@ export type ContentOsPageRequest =
     };
 
 export type KaitoxDraftStatus =
-  | { status: 'pending' | 'uploading' }
-  | { status: 'done'; restId: string; editUrl: string }
-  | { status: 'failed'; error: ContentOsPublicError };
+  | { handoffId: string; status: 'pending' | 'uploading' }
+  | { handoffId: string; status: 'done'; restId: string; editUrl: string }
+  | { handoffId: string; status: 'failed'; error: ContentOsPublicError };
 
 export type ContentOsRuntimeResponse =
   | { available: true; draftOnly: true }

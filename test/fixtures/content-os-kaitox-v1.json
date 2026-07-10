@@ -1,0 +1,51 @@
+{
+  "manifest": {
+    "schemaVersion": 1,
+    "handoffId": "handoff-compat-v1",
+    "title": "Cross-repo compatibility",
+    "markdown": "![compat](https://media.aizao.ai/x-article-media/compat.png)",
+    "targetHandle": "@aaxiaoshi666",
+    "assets": [
+      {
+        "key": "x-article-media/compat.png",
+        "src": "https://media.aizao.ai/x-article-media/compat.png",
+        "fileName": "compat.png",
+        "mime": "image/png",
+        "bytesLen": 70,
+        "sha256": "0fbc91e1bc582c5d4a730903c55f567af9561fd8db39bee8d4ee819d0df96a02"
+      }
+    ],
+    "mediaMap": [
+      {
+        "assetIndex": 0,
+        "figureIds": ["figure-1"],
+        "sourceIndexes": [0],
+        "cellLabels": []
+      }
+    ],
+    "source": "content-os",
+    "createdAt": "2026-07-10T03:30:00.000Z",
+    "expiresAt": "2026-07-10T04:30:00.000Z"
+  },
+  "statusRequest": {
+    "type": "KAITOX_STATUS",
+    "draftId": "draft-compat-v1",
+    "handoffId": "handoff-compat-v1"
+  },
+  "pendingStatus": {
+    "handoffId": "handoff-compat-v1",
+    "status": "pending"
+  },
+  "doneStatus": {
+    "handoffId": "handoff-compat-v1",
+    "status": "done",
+    "restId": "rest-compat-v1",
+    "editUrl": "https://x.com/compose/articles/edit/rest-compat-v1"
+  },
+  "errorResponse": {
+    "error": {
+      "code": "RELAY_UNAVAILABLE",
+      "message": "本地 Kaitox 服务暂不可用。"
+    }
+  }
+}

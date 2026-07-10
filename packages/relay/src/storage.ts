@@ -3,15 +3,44 @@
  * ~/.kaitox/<kind>/{outbox,sent}/<id>/bundle.json + assets/<fileName>。
  * kind 一律由路由层从 /:kind/... 路径段传入（已校验），storage 只当作目录段用。
  */
-import { mkdir, readFile, writeFile, readdir, rm, rename, stat } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, writeFile, readdir, rm, rename, stat, link } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { base64ToBytes } from '@kaitox/relay-protocol';
 import type { DraftAckPatch, DraftBundle, DraftListItem, PostDraftWireBody } from '@kaitox/relay-protocol';
-import { outboxDir, sentDir } from './config.js';
+import { idempotencyDir, outboxDir, sentDir } from './config.js';
 import { fitImageBytes } from './imageFit.js';
 
 const BUNDLE_FILE = 'bundle.json';
 const ASSETS_DIR = 'assets';
+const HANDOFF_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
+
+interface HandoffIdentity {
+  handoffId: string;
+  fingerprint: string;
+}
+
+interface HandoffPrecommit extends HandoffIdentity {
+  version: 1;
+  draftId: string;
+}
+
+export interface SaveDraftHooks {
+  afterIdempotencyPrecommit?: () => void | Promise<void>;
+}
+
+export class IdempotencyConflictError extends Error {
+  constructor() {
+    super('handoff idempotency conflict');
+    this.name = 'IdempotencyConflictError';
+  }
+}
+
+const activeIdempotentSaves = new Map<string, {
+  fingerprint: string;
+  promise: Promise<string>;
+}>();
 
 /** id / 文件名清洗，防目录穿越。 */
 export function sanitizeId(id: string): string {
@@ -28,16 +57,75 @@ export function sanitizeFileName(name: string): string {
 async function ensureDirs(kind: string): Promise<void> {
   await mkdir(outboxDir(kind), { recursive: true });
   await mkdir(sentDir(kind), { recursive: true });
+  await mkdir(idempotencyDir(kind), { recursive: true });
 }
 
 function draftDir(kind: string, id: string, sent = false): string {
   return join(sent ? sentDir(kind) : outboxDir(kind), id);
 }
 
-/** 落盘一份草稿包（POST /:kind/drafts）。kind 由路由层从路径段传入，用于命名空间与盖章。返回 id。 */
-export async function saveDraft(wire: PostDraftWireBody, kind: string): Promise<string> {
-  await ensureDirs(kind);
-  const id = sanitizeId(wire.bundle.id);
+function handoffIdentity(wire: PostDraftWireBody): HandoffIdentity | undefined {
+  if (wire.bundle.source !== 'content-os') return undefined;
+  const handoffId = wire.bundle.sourceMeta?.handoffId;
+  const fingerprint = wire.bundle.sourceMeta?.handoffFingerprint;
+  if (typeof handoffId !== 'string'
+    || !HANDOFF_ID_PATTERN.test(handoffId)
+    || typeof fingerprint !== 'string'
+    || !FINGERPRINT_PATTERN.test(fingerprint)) {
+    throw new IdempotencyConflictError();
+  }
+  return { handoffId, fingerprint };
+}
+
+function stableHandoffKey(kind: string, handoffId: string): string {
+  return createHash('sha256').update(`${kind}\0${handoffId}`).digest('hex');
+}
+
+function parsePrecommit(value: unknown): HandoffPrecommit | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1
+    || typeof record.handoffId !== 'string'
+    || typeof record.fingerprint !== 'string'
+    || typeof record.draftId !== 'string') return undefined;
+  return record as unknown as HandoffPrecommit;
+}
+
+async function ensureHandoffPrecommit(kind: string, identity: HandoffIdentity): Promise<HandoffPrecommit> {
+  const key = stableHandoffKey(kind, identity.handoffId);
+  const file = join(idempotencyDir(kind), `${key}.json`);
+  const record: HandoffPrecommit = {
+    version: 1,
+    ...identity,
+    draftId: `contentos-${key.slice(0, 32)}`,
+  };
+  const temp = `${file}.${randomUUID()}.tmp`;
+  await writeFile(temp, JSON.stringify(record), 'utf8');
+  try {
+    await link(temp, file);
+    return record;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    let existing: HandoffPrecommit | undefined;
+    try {
+      existing = parsePrecommit(JSON.parse(await readFile(file, 'utf8')));
+    } catch {
+      existing = undefined;
+    }
+    if (!existing
+      || existing.handoffId !== identity.handoffId
+      || existing.fingerprint !== identity.fingerprint
+      || existing.draftId !== record.draftId) {
+      throw new IdempotencyConflictError();
+    }
+    return existing;
+  } finally {
+    await rm(temp, { force: true }).catch(() => {});
+  }
+}
+
+async function writeDraft(wire: PostDraftWireBody, kind: string, requestedId: string): Promise<string> {
+  const id = sanitizeId(requestedId);
   const dir = draftDir(kind, id);
   await mkdir(join(dir, ASSETS_DIR), { recursive: true });
 
@@ -64,6 +152,56 @@ export async function saveDraft(wire: PostDraftWireBody, kind: string): Promise<
   };
   await writeFile(join(dir, BUNDLE_FILE), JSON.stringify(bundle, null, 2), 'utf8');
   return id;
+}
+
+async function saveIdempotentDraft(
+  wire: PostDraftWireBody,
+  kind: string,
+  identity: HandoffIdentity,
+  hooks: SaveDraftHooks,
+): Promise<string> {
+  const record = await ensureHandoffPrecommit(kind, identity);
+  const existing = await getDraft(record.draftId, kind);
+  if (existing) {
+    if (existing.source !== 'content-os'
+      || existing.sourceMeta?.handoffId !== identity.handoffId
+      || existing.sourceMeta?.handoffFingerprint !== identity.fingerprint) {
+      throw new IdempotencyConflictError();
+    }
+    return record.draftId;
+  }
+
+  await hooks.afterIdempotencyPrecommit?.();
+  await rm(draftDir(kind, record.draftId), { recursive: true, force: true });
+  return writeDraft({
+    ...wire,
+    bundle: { ...wire.bundle, id: record.draftId },
+  }, kind, record.draftId);
+}
+
+/** 落盘一份草稿包（POST /:kind/drafts）。Content OS handoff 使用 relay 级持久幂等身份。 */
+export async function saveDraft(
+  wire: PostDraftWireBody,
+  kind: string,
+  hooks: SaveDraftHooks = {},
+): Promise<string> {
+  await ensureDirs(kind);
+  const identity = handoffIdentity(wire);
+  if (!identity) return writeDraft(wire, kind, wire.bundle.id);
+
+  const key = stableHandoffKey(kind, identity.handoffId);
+  const active = activeIdempotentSaves.get(key);
+  if (active) {
+    if (active.fingerprint !== identity.fingerprint) throw new IdempotencyConflictError();
+    return active.promise;
+  }
+  const promise = saveIdempotentDraft(wire, kind, identity, hooks);
+  activeIdempotentSaves.set(key, { fingerprint: identity.fingerprint, promise });
+  try {
+    return await promise;
+  } finally {
+    if (activeIdempotentSaves.get(key)?.promise === promise) activeIdempotentSaves.delete(key);
+  }
 }
 
 async function readBundleFrom(dir: string): Promise<DraftBundle | null> {

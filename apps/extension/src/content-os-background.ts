@@ -1,4 +1,4 @@
-import { HttpRelayClient } from '@kaitox/relay-protocol';
+import { HttpRelayClient, RelayHttpError } from '@kaitox/relay-protocol';
 import type { DraftBundle, PostDraftInput } from '@kaitox/relay-protocol';
 import {
   CONTENT_OS_ORIGIN,
@@ -68,6 +68,13 @@ function readStoredHandoffRecord(value: unknown): StoredHandoffRecord | undefine
     || typeof record.draftId !== 'string'
     || record.targetHandle !== CONTENT_OS_TARGET_HANDLE) return undefined;
   return record as unknown as StoredHandoffRecord;
+}
+
+function isRelayIdempotencyConflict(error: unknown): boolean {
+  if (error instanceof RelayHttpError) return error.status === 409;
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { name?: unknown; status?: unknown };
+  return value.name === 'RelayHttpError' && value.status === 409;
 }
 
 async function defaultRelayClient(): Promise<HttpRelayClient> {
@@ -241,6 +248,9 @@ async function enqueueValidatedHandoff(
   );
   const bodyBytes = downloaded.slice(0, manifest.assets.length);
   const coverBytes = manifest.cover ? downloaded[manifest.assets.length] : undefined;
+  if (!validateHandoff(manifest, { now: dependencies.now }).ok) {
+    throw new ContentOsBridgeError('INVALID_HANDOFF');
+  }
   let draftId: string;
   try {
     const client = await dependencies.getClient();
@@ -273,6 +283,9 @@ async function enqueueValidatedHandoff(
     }));
   } catch (error) {
     if (error instanceof ContentOsBridgeError) throw error;
+    if (isRelayIdempotencyConflict(error)) {
+      throw new ContentOsBridgeError('HANDOFF_REPLAY_CONFLICT');
+    }
     throw new ContentOsBridgeError('RELAY_UNAVAILABLE');
   }
 
@@ -315,13 +328,13 @@ export async function enqueueContentOsHandoff(
   }
 }
 
-function strictDoneStatus(draft: DraftBundle): KaitoxDraftStatus {
+function strictDoneStatus(draft: DraftBundle, handoffId: string): KaitoxDraftStatus {
   if (draft.targetHandle !== CONTENT_OS_TARGET_HANDLE
     || !draft.restId
     || draft.editUrl !== `https://x.com/compose/articles/edit/${draft.restId}`) {
     throw new ContentOsBridgeError('STATUS_MISMATCH');
   }
-  return { status: 'done', restId: draft.restId, editUrl: draft.editUrl };
+  return { handoffId, status: 'done', restId: draft.restId, editUrl: draft.editUrl };
 }
 
 export async function contentOsDraftStatus(
@@ -342,11 +355,11 @@ export async function contentOsDraftStatus(
     throw new ContentOsBridgeError('STATUS_MISMATCH');
   }
   const status = draft.status ?? 'pending';
-  if (status === 'done') return strictDoneStatus(draft);
+  if (status === 'done') return strictDoneStatus(draft, handoffId);
   if (status === 'failed') {
-    return { status, error: contentOsPublicError(new ContentOsBridgeError('DRAFT_FAILED')) };
+    return { handoffId, status, error: contentOsPublicError(new ContentOsBridgeError('DRAFT_FAILED')) };
   }
-  if (status === 'pending' || status === 'uploading') return { status };
+  if (status === 'pending' || status === 'uploading') return { handoffId, status };
   throw new ContentOsBridgeError('STATUS_MISMATCH');
 }
 

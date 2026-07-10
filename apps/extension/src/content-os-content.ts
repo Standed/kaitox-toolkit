@@ -33,7 +33,7 @@ function invalidResponse(): ContentOsRuntimeResponse {
 }
 
 export function normalizeContentOsRuntimeResponse(
-  requestType: ContentOsPageRequest['type'],
+  request: ContentOsPageRequest,
   value: unknown,
 ): ContentOsRuntimeResponse {
   if (!isRecord(value)) return invalidResponse();
@@ -42,18 +42,19 @@ export function normalizeContentOsRuntimeResponse(
     return error ? { error } : invalidResponse();
   }
 
-  if (requestType === 'KAITOX_PING') {
+  if (request.type === 'KAITOX_PING') {
     return value.available === true && value.draftOnly === true
       ? { available: true, draftOnly: true }
       : invalidResponse();
   }
-  if (requestType === 'KAITOX_ENQUEUE') {
+  if (request.type === 'KAITOX_ENQUEUE') {
     return typeof value.draftId === 'string' && value.draftId.trim()
       ? { draftId: value.draftId }
       : invalidResponse();
   }
 
   const status = value.status;
+  if (value.handoffId !== request.handoffId) return invalidResponse();
   if (!['pending', 'uploading', 'done', 'failed'].includes(String(status))) {
     return invalidResponse();
   }
@@ -63,13 +64,13 @@ export function normalizeContentOsRuntimeResponse(
       || value.editUrl !== `https://x.com/compose/articles/edit/${value.restId}`) {
       return invalidResponse();
     }
-    return { status: 'done', restId: value.restId, editUrl: value.editUrl };
+    return { handoffId: request.handoffId, status: 'done', restId: value.restId, editUrl: value.editUrl };
   }
   if (status === 'failed') {
     const error = parseContentOsPublicError(value.error);
-    return error ? { status: 'failed', error } : invalidResponse();
+    return error ? { handoffId: request.handoffId, status: 'failed', error } : invalidResponse();
   }
-  return { status } as ContentOsRuntimeResponse;
+  return { handoffId: request.handoffId, status } as ContentOsRuntimeResponse;
 }
 
 export async function handleContentOsPageMessage(
@@ -83,7 +84,7 @@ export async function handleContentOsPageMessage(
   let response: ContentOsRuntimeResponse;
   try {
     response = normalizeContentOsRuntimeResponse(
-      request.type,
+      request,
       await dependencies.sendRuntimeMessage(request),
     );
   } catch (error) {
