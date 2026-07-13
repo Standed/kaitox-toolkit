@@ -10,7 +10,12 @@
  * 唯一的额外变换是 mermaid 围栏：默认渲染成 PNG 走图片通道（X 没有 mermaid 支持）。
  */
 import { publishXArticle, extractMermaidBlocks } from '@kaitox/x-article';
-import type { ImageFetcher, CoverFetcher } from '@kaitox/x-article';
+import type {
+  CoverFetcher,
+  ImageFetcher,
+  PublishArticleCheckpoint,
+  PublishArticleResume,
+} from '@kaitox/x-article';
 import type { DraftBundle, RelayClient } from '@kaitox/relay-protocol';
 import { createQueryIdRefreshingFetch } from './query-id-discovery.js';
 import { readCt0, getArticleQueryIds, refreshArticleQueryIds } from './xsession.js';
@@ -23,10 +28,16 @@ export interface UploadResult {
 
 export type DraftAssetReader = Pick<RelayClient, 'getAsset'>;
 
+export interface UploadDraftOptions {
+  resume?: PublishArticleResume;
+  onCheckpoint?: (checkpoint: PublishArticleCheckpoint) => Promise<void> | void;
+}
+
 export async function uploadDraft(
   draft: DraftBundle,
   client: DraftAssetReader,
   onProgress?: (message: string) => void,
+  options: UploadDraftOptions = {},
 ): Promise<UploadResult> {
   const ct0 = readCt0();
   if (!ct0) throw new Error('读取不到 ct0——请确认当前已登录 x.com 再试。');
@@ -75,6 +86,8 @@ export async function uploadDraft(
     },
     fetchImage,
     fetchCover,
+    resume: options.resume,
+    onCheckpoint: options.onCheckpoint,
     // 各阶段映射成人话，实时刷新详情面板的提示行。
     onProgress: (p) => {
       if (p.stage === 'images') {

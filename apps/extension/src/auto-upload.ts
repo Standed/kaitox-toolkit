@@ -1,15 +1,22 @@
 import type { DraftAckPatch, DraftBundle, RelayClient } from '@kaitox/relay-protocol';
+import type { PublishArticleCheckpoint, PublishArticleResume } from '@kaitox/x-article';
 import { CONTENT_OS_TARGET_HANDLE } from './content-os-protocol.js';
-import { uploadDraft, type UploadResult } from './uploader.js';
+import {
+  createUploadQueueClient,
+  type UploadClaim,
+  type UploadQueueClient,
+  type UploadQueueStatus,
+} from './upload-queue.js';
+import { uploadDraft, type UploadDraftOptions, type UploadResult } from './uploader.js';
 import { getRelayClient } from './xsession.js';
 
-const AUTO_UPLOAD_DRAFT_KEY = 'kaitoxAutoUploadDraftId';
-const RESULT_KEY_PREFIX = 'kaitoxAutoUploadResult:';
+const CHECKPOINT_KEY_PREFIX = 'kaitoxAutoUploadResult:';
 const REQUIRED_HANDLE = CONTENT_OS_TARGET_HANDLE;
 const REQUIRED_HANDLE_BARE = REQUIRED_HANDLE.slice(1).toLowerCase();
 const PROFILE_LINK_SELECTOR = 'a[data-testid="AppTabBar_Profile_Link"]';
 const PROFILE_WAIT_MS = 10_000;
 const PROFILE_POLL_MS = 100;
+const LEASE_RENEW_MS = 10_000;
 const RESERVED_X_PATHS = new Set([
   'compose',
   'explore',
@@ -28,14 +35,20 @@ export interface StrictUploadResult {
   editUrl: string;
 }
 
-interface StoredUploadResult extends StrictUploadResult {
-  version: 1;
+type StoredCheckpointStage = PublishArticleCheckpoint['stage'] | 'ready-to-ack';
+
+interface StoredUploadCheckpoint extends StrictUploadResult {
+  version: 2;
   targetHandle: typeof REQUIRED_HANDLE;
+  stage: StoredCheckpointStage;
+  mediaMap: Record<string, string>;
+  coverMediaId?: string;
+  updatedAt: string;
 }
 
-export interface UploadResultStore {
+export interface UploadCheckpointStore {
   get(id: string): Promise<unknown>;
-  set(id: string, result: StoredUploadResult): Promise<void>;
+  set(id: string, checkpoint: StoredUploadCheckpoint): Promise<void>;
   remove(id: string): Promise<void>;
 }
 
@@ -46,9 +59,11 @@ export interface UploadQueuedDraftDeps {
     bundle: DraftBundle,
     client: UploadClient,
     onProgress?: (message: string) => void,
+    options?: UploadDraftOptions,
   ) => Promise<UploadResult>;
-  resultStore?: UploadResultStore;
+  checkpointStore?: UploadCheckpointStore;
   onProgress?: (message: string) => void;
+  assertLease?: () => Promise<void>;
 }
 
 export interface ActiveTargetHandleOptions {
@@ -59,27 +74,56 @@ export interface ActiveTargetHandleOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-interface AutoUploadStorage {
-  get(key: string): Promise<Record<string, unknown>>;
-  remove(key: string): Promise<void>;
+export interface RunQueuedDraftDeps extends UploadQueuedDraftDeps {
+  queueClient?: UploadQueueClient;
+  renewMs?: number;
 }
 
 export interface RunAutoUploadDeps {
   pathname?: string;
-  storage?: AutoUploadStorage;
+  queueClient?: UploadQueueClient;
   getClient?: () => Promise<UploadClient>;
   navigate?: (url: string) => void;
+  sleep?: (ms: number) => Promise<void>;
   uploadDeps?: Omit<UploadQueuedDraftDeps, 'client'>;
 }
 
-function normalizeHandle(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const bare = value.trim().replace(/^@/, '');
-  return /^[A-Za-z0-9_]{1,15}$/.test(bare) ? bare.toLowerCase() : undefined;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function declaredTargetHandle(bundle: DraftBundle): string | undefined {
-  return normalizeHandle(bundle.targetHandle ?? bundle.sourceMeta?.targetHandle);
+function normalizeDeclaredHandle(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^@[A-Za-z0-9_]{1,15}$/.test(value)) {
+    throw new Error(`${label} 格式无效，必须是 @handle`);
+  }
+  return value.slice(1).toLowerCase();
+}
+
+export function validateDeclaredTargetHandles(bundle: DraftBundle): typeof REQUIRED_HANDLE {
+  const declarations: Array<{ label: string; value: unknown }> = [];
+  if (bundle.targetHandle !== undefined) {
+    declarations.push({ label: 'bundle.targetHandle', value: bundle.targetHandle });
+  }
+
+  const sourceMeta = bundle.sourceMeta;
+  const hasSourceMetaTarget = isRecord(sourceMeta)
+    && Object.prototype.hasOwnProperty.call(sourceMeta, 'targetHandle');
+  if (hasSourceMetaTarget) {
+    declarations.push({ label: 'bundle.sourceMeta.targetHandle', value: sourceMeta.targetHandle });
+  }
+  if (bundle.source === 'content-os' && !hasSourceMetaTarget) {
+    throw new Error(`Content OS 草稿缺少目标账号 ${REQUIRED_HANDLE}`);
+  }
+  if (bundle.status === 'done' && bundle.targetHandle === undefined) {
+    throw new Error('已完成草稿缺少 bundle.targetHandle');
+  }
+
+  const normalized = declarations.map(({ label, value }) => normalizeDeclaredHandle(value, label));
+  if (new Set(normalized).size > 1) throw new Error('草稿中的 targetHandle 声明互相冲突');
+  if (normalized.some((handle) => handle !== REQUIRED_HANDLE_BARE)) {
+    throw new Error(`草稿目标账号必须是 ${REQUIRED_HANDLE}`);
+  }
+  return REQUIRED_HANDLE;
 }
 
 function errorMessage(error: unknown): string {
@@ -90,43 +134,113 @@ function canonicalEditUrl(restId: string): string {
   return `https://x.com/compose/articles/edit/${restId}`;
 }
 
+function validRestId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
 function readStrictDone(bundle: DraftBundle): StrictUploadResult | undefined {
   if (bundle.status !== 'done') return undefined;
   const restId = typeof bundle.restId === 'string' ? bundle.restId.trim() : '';
   const editUrl = restId ? canonicalEditUrl(restId) : '';
-  if (normalizeHandle(bundle.targetHandle) !== REQUIRED_HANDLE_BARE
-    || !restId
+  if (!validRestId(restId)
+    || bundle.targetHandle !== REQUIRED_HANDLE
     || bundle.editUrl !== editUrl) {
     throw new Error('relay 中的已完成草稿缺少严格可验证结果');
   }
   return { restId, editUrl };
 }
 
-function readStoredResult(value: unknown): StoredUploadResult | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  const restId = typeof record.restId === 'string' ? record.restId.trim() : '';
-  if (record.version !== 1
-    || record.targetHandle !== REQUIRED_HANDLE
-    || !/^[A-Za-z0-9_-]+$/.test(restId)
-    || record.editUrl !== canonicalEditUrl(restId)) {
-    return undefined;
-  }
-  return record as unknown as StoredUploadResult;
+const CHECKPOINT_STAGES = new Set<StoredCheckpointStage>([
+  'draft-created',
+  'title-updated',
+  'images-uploaded',
+  'content-updated',
+  'cover-uploaded',
+  'cover-updated',
+  'ready-to-ack',
+]);
+
+function readMediaMap(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.some(([src, mediaId]) => !src || typeof mediaId !== 'string' || !mediaId)) return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
-function chromeResultStore(): UploadResultStore {
+function readStoredCheckpoint(value: unknown): StoredUploadCheckpoint | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('上传恢复检查点损坏，已拒绝重新创建 X 草稿');
+
+  const restId = typeof value.restId === 'string' ? value.restId.trim() : '';
+  if (value.version === 1
+    && value.targetHandle === REQUIRED_HANDLE
+    && validRestId(restId)
+    && value.editUrl === canonicalEditUrl(restId)) {
+    return {
+      version: 2,
+      targetHandle: REQUIRED_HANDLE,
+      restId,
+      editUrl: canonicalEditUrl(restId),
+      stage: 'ready-to-ack',
+      mediaMap: {},
+      updatedAt: new Date(0).toISOString(),
+    };
+  }
+
+  const mediaMap = readMediaMap(value.mediaMap);
+  if (value.version !== 2
+    || value.targetHandle !== REQUIRED_HANDLE
+    || !validRestId(restId)
+    || value.editUrl !== canonicalEditUrl(restId)
+    || typeof value.stage !== 'string'
+    || !CHECKPOINT_STAGES.has(value.stage as StoredCheckpointStage)
+    || !mediaMap
+    || (value.coverMediaId !== undefined && (typeof value.coverMediaId !== 'string' || !value.coverMediaId))
+    || typeof value.updatedAt !== 'string'
+    || !Number.isFinite(Date.parse(value.updatedAt))) {
+    throw new Error('上传恢复检查点损坏，已拒绝重新创建 X 草稿');
+  }
+  return { ...value, restId, mediaMap } as unknown as StoredUploadCheckpoint;
+}
+
+function chromeCheckpointStore(): UploadCheckpointStore {
   return {
     async get(id) {
-      const key = `${RESULT_KEY_PREFIX}${id}`;
+      const key = `${CHECKPOINT_KEY_PREFIX}${id}`;
       return (await chrome.storage.local.get(key))[key];
     },
-    async set(id, result) {
-      await chrome.storage.local.set({ [`${RESULT_KEY_PREFIX}${id}`]: result });
+    async set(id, checkpoint) {
+      await chrome.storage.local.set({ [`${CHECKPOINT_KEY_PREFIX}${id}`]: checkpoint });
     },
     async remove(id) {
-      await chrome.storage.local.remove(`${RESULT_KEY_PREFIX}${id}`);
+      await chrome.storage.local.remove(`${CHECKPOINT_KEY_PREFIX}${id}`);
     },
+  };
+}
+
+function storedCheckpoint(
+  checkpoint: PublishArticleCheckpoint,
+  stage: StoredCheckpointStage = checkpoint.stage,
+): StoredUploadCheckpoint {
+  if (!validRestId(checkpoint.restId)) throw new Error('X 草稿检查点缺少有效 rest_id');
+  return {
+    version: 2,
+    targetHandle: REQUIRED_HANDLE,
+    restId: checkpoint.restId,
+    editUrl: canonicalEditUrl(checkpoint.restId),
+    stage,
+    mediaMap: { ...checkpoint.mediaMap },
+    coverMediaId: checkpoint.coverMediaId,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function checkpointResume(checkpoint: StoredUploadCheckpoint | undefined): PublishArticleResume | undefined {
+  if (!checkpoint) return undefined;
+  return {
+    restId: checkpoint.restId,
+    mediaMap: checkpoint.mediaMap,
+    coverMediaId: checkpoint.coverMediaId,
   };
 }
 
@@ -152,10 +266,7 @@ export async function assertActiveTargetHandle(
   bundle: DraftBundle,
   options: ActiveTargetHandleOptions = {},
 ): Promise<typeof REQUIRED_HANDLE> {
-  const declared = declaredTargetHandle(bundle);
-  if (declared && declared !== REQUIRED_HANDLE_BARE) {
-    throw new Error(`草稿目标账号必须是 ${REQUIRED_HANDLE}，当前为 @${declared}`);
-  }
+  validateDeclaredTargetHandles(bundle);
 
   const timeoutMs = options.timeoutMs ?? PROFILE_WAIT_MS;
   const pollMs = options.pollMs ?? PROFILE_POLL_MS;
@@ -181,61 +292,64 @@ export async function assertActiveTargetHandle(
   }
 }
 
-const activeUploads = new Map<string, Promise<StrictUploadResult>>();
-
-async function performQueuedUpload(id: string, deps: UploadQueuedDraftDeps): Promise<StrictUploadResult> {
-  const resultStore = deps.resultStore ?? chromeResultStore();
+export async function uploadQueuedDraft(id: string, deps: UploadQueuedDraftDeps): Promise<StrictUploadResult> {
+  const checkpointStore = deps.checkpointStore ?? chromeCheckpointStore();
   try {
     const bundle = await deps.client.getDraft(id);
+    const targetHandle = await (deps.assertTargetHandle ?? assertActiveTargetHandle)(bundle);
+    if (targetHandle !== REQUIRED_HANDLE) throw new Error(`当前 X 账号必须是 ${REQUIRED_HANDLE}`);
+    await deps.assertLease?.();
+
     const completed = readStrictDone(bundle);
     if (completed) {
-      await resultStore.remove(id);
+      await checkpointStore.remove(id);
       return completed;
     }
 
     await deps.client.ack(id, { status: 'uploading' });
-    const targetHandle = await (deps.assertTargetHandle ?? assertActiveTargetHandle)(bundle);
-    if (normalizeHandle(targetHandle) !== REQUIRED_HANDLE_BARE) {
-      throw new Error(`当前 X 账号必须是 ${REQUIRED_HANDLE}`);
-    }
-
-    const stored = readStoredResult(await resultStore.get(id));
-    if (stored) {
+    const checkpoint = readStoredCheckpoint(await checkpointStore.get(id));
+    if (checkpoint?.stage === 'ready-to-ack') {
+      await deps.assertLease?.();
       await deps.client.ack(id, {
         status: 'done',
         targetHandle: REQUIRED_HANDLE,
-        restId: stored.restId,
-        editUrl: stored.editUrl,
+        restId: checkpoint.restId,
+        editUrl: checkpoint.editUrl,
       });
-      await resultStore.remove(id);
-      return { restId: stored.restId, editUrl: stored.editUrl };
+      await checkpointStore.remove(id);
+      return { restId: checkpoint.restId, editUrl: checkpoint.editUrl };
     }
-    await resultStore.remove(id);
 
-    const result = await (deps.uploadDraft ?? uploadDraft)(bundle, deps.client, deps.onProgress);
+    const result = await (deps.uploadDraft ?? uploadDraft)(bundle, deps.client, deps.onProgress, {
+      resume: checkpointResume(checkpoint),
+      onCheckpoint: async (next) => {
+        await checkpointStore.set(id, storedCheckpoint(next));
+        await deps.assertLease?.();
+      },
+    });
     const restId = typeof result.restId === 'string' ? result.restId.trim() : '';
-    if (!/^[A-Za-z0-9_-]+$/.test(restId)) {
-      throw new Error('X 草稿不完整或缺少 rest_id');
-    }
+    if (!validRestId(restId)) throw new Error('X 草稿不完整或缺少 rest_id');
     if (result.skippedImages.length > 0) {
       throw new Error(`X 草稿不完整，跳过了 ${result.skippedImages.length} 张图片`);
     }
 
-    const storedResult: StoredUploadResult = {
-      version: 1,
-      targetHandle: REQUIRED_HANDLE,
+    const latest = readStoredCheckpoint(await checkpointStore.get(id));
+    const ready = storedCheckpoint({
+      stage: latest?.stage === 'cover-updated' ? 'cover-updated' : 'content-updated',
       restId,
-      editUrl: canonicalEditUrl(restId),
-    };
-    await resultStore.set(id, storedResult);
+      mediaMap: latest?.mediaMap ?? {},
+      coverMediaId: latest?.coverMediaId,
+    }, 'ready-to-ack');
+    await checkpointStore.set(id, ready);
+    await deps.assertLease?.();
     await deps.client.ack(id, {
       status: 'done',
       targetHandle: REQUIRED_HANDLE,
-      restId: storedResult.restId,
-      editUrl: storedResult.editUrl,
+      restId: ready.restId,
+      editUrl: ready.editUrl,
     });
-    await resultStore.remove(id);
-    return { restId: storedResult.restId, editUrl: storedResult.editUrl };
+    await checkpointStore.remove(id);
+    return { restId: ready.restId, editUrl: ready.editUrl };
   } catch (error) {
     const failedPatch: DraftAckPatch = { status: 'failed', error: errorMessage(error) };
     await deps.client.ack(id, failedPatch).catch(() => {});
@@ -243,37 +357,77 @@ async function performQueuedUpload(id: string, deps: UploadQueuedDraftDeps): Pro
   }
 }
 
-export function uploadQueuedDraft(id: string, deps: UploadQueuedDraftDeps): Promise<StrictUploadResult> {
-  const existing = activeUploads.get(id);
-  if (existing) return existing;
-  const promise = performQueuedUpload(id, deps);
-  activeUploads.set(id, promise);
-  void promise.finally(() => {
-    if (activeUploads.get(id) === promise) activeUploads.delete(id);
-  }).catch(() => {});
-  return promise;
+async function runClaimedUpload(
+  claim: UploadClaim,
+  deps: RunQueuedDraftDeps,
+): Promise<StrictUploadResult> {
+  const queueClient = deps.queueClient ?? createUploadQueueClient();
+  let currentClaim = claim;
+  let leaseError: Error | undefined;
+  const renew = async () => {
+    try {
+      const renewed = await queueClient.renew(currentClaim);
+      if (!renewed) leaseError = new Error('上传租约已失效，请从面板恢复');
+      else currentClaim = renewed;
+    } catch (error) {
+      leaseError = error instanceof Error ? error : new Error(String(error));
+    }
+  };
+  const timer = setInterval(() => void renew(), deps.renewMs ?? LEASE_RENEW_MS);
+  try {
+    await renew();
+    if (leaseError) throw leaseError;
+    const result = await uploadQueuedDraft(claim.draftId, {
+      ...deps,
+      assertLease: async () => {
+        await renew();
+        if (leaseError) throw leaseError;
+      },
+    });
+    if (leaseError) throw leaseError;
+    if (!await queueClient.complete(currentClaim)) throw new Error('上传租约已被其他标签页接管');
+    return result;
+  } catch (error) {
+    await queueClient.fail(currentClaim).catch(() => false);
+    throw error;
+  } finally {
+    clearInterval(timer);
+  }
 }
 
-let takeQueue: Promise<void> = Promise.resolve();
+export async function runQueuedDraftUpload(id: string, deps: RunQueuedDraftDeps): Promise<StrictUploadResult> {
+  const queueClient = deps.queueClient ?? createUploadQueueClient();
+  const claimed = await queueClient.claim(id);
+  if (claimed.status === 'wait') throw new Error('草稿正在另一个标签页上传');
+  if (claimed.status === 'empty') throw new Error('无法把草稿加入上传队列');
+  return runClaimedUpload(claimed.claim, { ...deps, queueClient });
+}
 
-export function takeAutoUploadDraftId(storage: AutoUploadStorage): Promise<string | undefined> {
-  const result = takeQueue.then(async () => {
-    const value = (await storage.get(AUTO_UPLOAD_DRAFT_KEY))[AUTO_UPLOAD_DRAFT_KEY];
-    await storage.remove(AUTO_UPLOAD_DRAFT_KEY);
-    return typeof value === 'string' && value.trim() ? value : undefined;
-  });
-  takeQueue = result.then(() => {}, () => {});
-  return result;
+export async function getUploadQueueStatus(
+  id: string,
+  queueClient: UploadQueueClient = createUploadQueueClient(),
+): Promise<UploadQueueStatus> {
+  return queueClient.status(id);
 }
 
 export async function runAutoUploadFromQueue(deps: RunAutoUploadDeps = {}): Promise<StrictUploadResult | undefined> {
   const pathname = (deps.pathname ?? location.pathname).replace(/\/+$/, '') || '/';
   if (pathname !== '/compose/articles') return undefined;
-  const storage = deps.storage ?? chrome.storage.local;
-  const id = await takeAutoUploadDraftId(storage);
-  if (!id) return undefined;
+  const queueClient = deps.queueClient ?? createUploadQueueClient();
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let claimed = await queueClient.claim();
+  while (claimed.status === 'wait') {
+    await sleep(Math.max(1, claimed.retryAt - Date.now()));
+    claimed = await queueClient.claim();
+  }
+  if (claimed.status === 'empty') return undefined;
+
   const client = await (deps.getClient ?? getRelayClient)();
-  const result = await uploadQueuedDraft(id, { ...deps.uploadDeps, client });
+  const result = await runClaimedUpload(claimed.claim, {
+    ...deps.uploadDeps,
+    client,
+    queueClient,
+  });
   (deps.navigate ?? ((url) => location.assign(url)))(result.editUrl);
   return result;
 }

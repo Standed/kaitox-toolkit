@@ -123,11 +123,24 @@ const autoUploadBuild = await buildTestModule({
 const autoUploadModuleUrl = `data:text/javascript;base64,${Buffer.from(autoUploadBuild.outputFiles[0].contents).toString('base64')}`;
 const {
   assertActiveTargetHandle,
+  getUploadQueueStatus,
   readActiveHandleFromHref,
   runAutoUploadFromQueue,
-  takeAutoUploadDraftId,
+  runQueuedDraftUpload,
   uploadQueuedDraft,
+  validateDeclaredTargetHandles,
 } = await import(autoUploadModuleUrl);
+
+const uploadQueueBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/upload-queue.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const uploadQueueModuleUrl = `data:text/javascript;base64,${Buffer.from(uploadQueueBuild.outputFiles[0].contents).toString('base64')}`;
+const { BackgroundUploadQueue } = await import(uploadQueueModuleUrl);
 
 const compatibilityFixture = JSON.parse(await readFile(
   new URL('./fixtures/content-os-kaitox-v1.json', import.meta.url),
@@ -154,7 +167,8 @@ const makeStorage = () => {
     values,
     removed,
     async get(key) {
-      return { [key]: values[key] };
+      const keys = Array.isArray(key) ? key : [key];
+      return Object.fromEntries(keys.map((item) => [item, values[item]]));
     },
     async set(patch) {
       Object.assign(values, patch);
@@ -231,6 +245,7 @@ check('cross-repo structured public error stays bounded',
     compatibilityFixture.errorResponse,
   )) === JSON.stringify(compatibilityFixture.errorResponse));
 check('wrong target handle is rejected', !handoffOk({ ...validHandoff, targetHandle: 'other' }));
+check('missing Content OS target handle is rejected', !handoffOk((({ targetHandle: _, ...rest }) => rest)(validHandoff)));
 check('the Content OS account is locked to @aaxiaoshi666', CONTENT_OS_TARGET_HANDLE === '@aaxiaoshi666');
 check('more than 25 body media are rejected', MAX_HANDOFF_MEDIA === 25 && !handoffOk({
   ...validHandoff,
@@ -401,7 +416,7 @@ let activeHandoffDownloads = 0;
 let maxActiveHandoffDownloads = 0;
 const handoffFetches = [];
 const postDraftInputs = [];
-const storedAutoUpload = [];
+const queuedAutoUploads = [];
 const openedTabs = [];
 const backgroundClient = {
   async postDraft(input) {
@@ -446,11 +461,13 @@ const backgroundDeps = {
     async get(key) { return { [key]: this.values[key] }; },
     async set(value) {
       Object.assign(this.values, value);
-      storedAutoUpload.push(value);
     },
   },
   tabs: {
     async create(value) { openedTabs.push(value); },
+  },
+  uploadQueue: {
+    async enqueue(id) { queuedAutoUploads.push(id); },
   },
 };
 const enqueueResult = await enqueueContentOsHandoff(backgroundManifest, backgroundDeps);
@@ -468,8 +485,8 @@ check('relay bundle preserves exact body src and verified local bytes',
 check('cover becomes the relay cover sentinel',
   postDraftInputs[0].cover.src === '__cover__' &&
   postDraftInputs[0].cover.bytes.byteLength === handoffBytes.byteLength);
-check('auto-upload id is stored before opening only the X Articles composer',
-  storedAutoUpload[0]?.kaitoxAutoUploadDraftId === 'draft-content-os-1' &&
+check('auto-upload draft enters the durable queue before opening only the X Articles composer',
+  queuedAutoUploads[0] === 'draft-content-os-1' &&
   openedTabs.length === 1 && openedTabs[0].url === 'https://x.com/compose/articles');
 
 const replayResult = await enqueueContentOsHandoff(backgroundManifest, backgroundDeps);
@@ -815,8 +832,8 @@ check('failed relay status exposes only a fixed public error code/message',
   !JSON.stringify(failedStatus).includes('/Users/person') &&
   !JSON.stringify(failedStatus).includes('token=abc'));
 
-// ---- -0.25. Task 7 account guard + strict automatic upload ----
-console.log('\n[-0.25] Task 7 account guard + strict automatic upload');
+// ---- -0.25. Task 7 account guard + durable automatic upload ----
+console.log('\n[-0.25] Task 7 account guard + durable automatic upload');
 check('active account parser accepts the exact profile path',
   readActiveHandleFromHref('/aaxiaoshi666') === 'aaxiaoshi666');
 check('active account parser rejects non-profile routes',
@@ -841,12 +858,12 @@ const makeAutoUploadDraft = (overrides = {}) => ({
   ...overrides,
 });
 
-const memoryResultStore = () => {
+const memoryCheckpointStore = () => {
   const values = new Map();
   return {
     values,
     async get(id) { return values.get(id); },
-    async set(id, result) { values.set(id, result); },
+    async set(id, checkpoint) { values.set(id, checkpoint); },
     async remove(id) { values.delete(id); },
   };
 };
@@ -855,14 +872,20 @@ const makeAutoUploadDeps = ({
   draft = makeAutoUploadDraft(),
   activeHref = '/aaxiaoshi666',
   uploadResult = { restId: 'REST_TASK_7', skippedImages: [] },
+  uploadImpl,
   failDoneAck = false,
-  resultStore = memoryResultStore(),
+  checkpointStore = memoryCheckpointStore(),
 } = {}) => {
   const acks = [];
   const uploadCalls = [];
   let doneAckFailures = failDoneAck ? 1 : 0;
   const client = {
-    async getDraft() { return { ...draft, sourceMeta: { ...draft.sourceMeta } }; },
+    async getDraft() {
+      return {
+        ...draft,
+        sourceMeta: draft.sourceMeta && { ...draft.sourceMeta },
+      };
+    },
     async getAsset() { return new Uint8Array(); },
     async ack(_id, patch) {
       acks.push(patch);
@@ -877,57 +900,70 @@ const makeAutoUploadDeps = ({
   return {
     deps: {
       client,
-      resultStore,
+      checkpointStore,
       assertTargetHandle: (bundle) => assertActiveTargetHandle(bundle, {
         timeoutMs: 0,
         readProfileHref: () => activeHref,
       }),
       uploadDraft: async (...args) => {
         uploadCalls.push(args);
+        if (uploadImpl) return uploadImpl(...args);
+        const options = args[3];
+        await options?.onCheckpoint?.({
+          stage: 'content-updated',
+          restId: uploadResult.restId,
+          mediaMap: {},
+        });
         return uploadResult;
       },
     },
     acks,
     draft,
-    resultStore,
+    checkpointStore,
     uploadCalls,
   };
 };
 
 const wrongAccount = makeAutoUploadDeps({ activeHref: '/other' });
-await assert.rejects(
-  () => uploadQueuedDraft(wrongAccount.draft.id, wrongAccount.deps),
-  /当前 X 账号/,
-);
+await assert.rejects(() => uploadQueuedDraft(wrongAccount.draft.id, wrongAccount.deps), /当前 X 账号/);
 check('wrong active account acks failed and performs no X upload',
-  wrongAccount.uploadCalls.length === 0 &&
-  wrongAccount.acks.at(-1)?.status === 'failed');
+  wrongAccount.uploadCalls.length === 0 && wrongAccount.acks.at(-1)?.status === 'failed');
 
-const wrongDeclaredTarget = makeAutoUploadDeps({
-  draft: makeAutoUploadDraft({ sourceMeta: { handoffId: 'task-7-handoff', targetHandle: '@other' } }),
-});
-await assert.rejects(
-  () => uploadQueuedDraft(wrongDeclaredTarget.draft.id, wrongDeclaredTarget.deps),
-  /目标账号/,
-);
-check('wrong bundle target performs no X upload', wrongDeclaredTarget.uploadCalls.length === 0);
+for (const [name, draft, pattern] of [
+  ['missing Content OS target is rejected', makeAutoUploadDraft({ sourceMeta: { handoffId: 'missing' } }), /缺少目标账号/],
+  ['malformed Content OS target is rejected', makeAutoUploadDraft({ sourceMeta: { handoffId: 'bad', targetHandle: 'aaxiaoshi666' } }), /格式无效/],
+  ['conflicting target declarations are rejected', makeAutoUploadDraft({
+    status: 'done',
+    targetHandle: '@other',
+    restId: 'REST_CONFLICT',
+    editUrl: 'https://x.com/compose/articles/edit/REST_CONFLICT',
+  }), /冲突|必须是/],
+]) {
+  const targetCase = makeAutoUploadDeps({ draft });
+  await assert.rejects(() => uploadQueuedDraft(draft.id, targetCase.deps), pattern);
+  check(name, targetCase.uploadCalls.length === 0);
+}
+check('every targetHandle declaration is validated independently', (() => {
+  try {
+    validateDeclaredTargetHandles(makeAutoUploadDraft({
+      targetHandle: 'malformed',
+      sourceMeta: { handoffId: 'independent', targetHandle: '@aaxiaoshi666' },
+    }));
+    return false;
+  } catch (error) {
+    return /bundle\.targetHandle 格式无效/.test(error.message);
+  }
+})());
 
 const noRestId = makeAutoUploadDeps({ uploadResult: { skippedImages: [] } });
-await assert.rejects(
-  () => uploadQueuedDraft(noRestId.draft.id, noRestId.deps),
-  /rest_id/,
-);
+await assert.rejects(() => uploadQueuedDraft(noRestId.draft.id, noRestId.deps), /rest_id/);
 check('missing rest_id never acks done',
-  noRestId.acks.every((patch) => patch.status !== 'done') &&
-  noRestId.acks.at(-1)?.status === 'failed');
+  noRestId.acks.every((patch) => patch.status !== 'done') && noRestId.acks.at(-1)?.status === 'failed');
 
 const skippedImage = makeAutoUploadDeps({
   uploadResult: { restId: 'REST_INCOMPLETE', skippedImages: ['missing.png'] },
 });
-await assert.rejects(
-  () => uploadQueuedDraft(skippedImage.draft.id, skippedImage.deps),
-  /不完整/,
-);
+await assert.rejects(() => uploadQueuedDraft(skippedImage.draft.id, skippedImage.deps), /不完整/);
 check('skipped images never ack done', skippedImage.acks.every((patch) => patch.status !== 'done'));
 
 const strictSuccess = makeAutoUploadDeps();
@@ -942,72 +978,202 @@ check('strict upload returns and acks the exact edit URL',
     editUrl: 'https://x.com/compose/articles/edit/REST_TASK_7',
   }));
 await uploadQueuedDraft(strictSuccess.draft.id, strictSuccess.deps);
-check('replaying a completed draft is idempotent and does not upload twice',
-  strictSuccess.uploadCalls.length === 1);
+check('replaying a completed draft is idempotent and does not upload twice', strictSuccess.uploadCalls.length === 1);
+
+const wrongDoneAccount = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({
+    status: 'done',
+    targetHandle: '@aaxiaoshi666',
+    restId: 'REST_DONE',
+    editUrl: 'https://x.com/compose/articles/edit/REST_DONE',
+  }),
+  activeHref: '/other',
+});
+await assert.rejects(() => uploadQueuedDraft(wrongDoneAccount.draft.id, wrongDoneAccount.deps), /当前 X 账号/);
+check('done replay verifies the active account before returning an edit URL', wrongDoneAccount.uploadCalls.length === 0);
 
 const recoverable = makeAutoUploadDeps({ failDoneAck: true });
-await assert.rejects(
-  () => uploadQueuedDraft(recoverable.draft.id, recoverable.deps),
-  /simulated relay done ack failure/,
-);
+await assert.rejects(() => uploadQueuedDraft(recoverable.draft.id, recoverable.deps), /simulated relay done ack failure/);
 check('a relay ack interruption preserves the verified result checkpoint',
-  recoverable.resultStore.values.get(recoverable.draft.id)?.restId === 'REST_TASK_7');
+  recoverable.checkpointStore.values.get(recoverable.draft.id)?.stage === 'ready-to-ack');
 const recoveredUploadResult = await uploadQueuedDraft(recoverable.draft.id, recoverable.deps);
 check('retry recovers the terminal ack without creating a duplicate X draft',
   recoveredUploadResult.restId === 'REST_TASK_7' &&
   recoverable.uploadCalls.length === 1 &&
-  recoverable.resultStore.values.has(recoverable.draft.id) === false);
+  recoverable.checkpointStore.values.has(recoverable.draft.id) === false);
 
-const queuedStorage = makeStorage();
-queuedStorage.values.kaitoxAutoUploadDraftId = 'queued-task-7';
-const [takenFirst, takenSecond] = await Promise.all([
-  takeAutoUploadDraftId(queuedStorage),
-  takeAutoUploadDraftId(queuedStorage),
+let remoteDraftCreates = 0;
+const crashRecovery = makeAutoUploadDeps({
+  uploadImpl: async (_bundle, _client, _progress, options) => {
+    if (!options?.resume) {
+      remoteDraftCreates++;
+      await options.onCheckpoint({
+        stage: 'draft-created',
+        restId: 'REST_AFTER_CRASH',
+        mediaMap: {},
+      });
+      throw new Error('simulated tab crash after draft create');
+    }
+    return { restId: options.resume.restId, skippedImages: [] };
+  },
+});
+await assert.rejects(() => uploadQueuedDraft(crashRecovery.draft.id, crashRecovery.deps), /simulated tab crash/);
+const crashRecoveredResult = await uploadQueuedDraft(crashRecovery.draft.id, crashRecovery.deps);
+check('reload resumes the checkpointed rest_id instead of creating another X draft',
+  crashRecoveredResult.restId === 'REST_AFTER_CRASH' && remoteDraftCreates === 1 && crashRecovery.uploadCalls.length === 2);
+
+const corruptCheckpoint = makeAutoUploadDeps();
+corruptCheckpoint.checkpointStore.values.set(corruptCheckpoint.draft.id, {
+  version: 2,
+  targetHandle: '@aaxiaoshi666',
+  restId: 'REST_UNKNOWN',
+  stage: 'draft-created',
+  mediaMap: 'corrupt',
+});
+await assert.rejects(() => uploadQueuedDraft(corruptCheckpoint.draft.id, corruptCheckpoint.deps), /检查点损坏/);
+check('a malformed recovery checkpoint fails closed without creating another X draft',
+  corruptCheckpoint.uploadCalls.length === 0);
+
+const queueStorage = makeStorage();
+let queueNow = 10_000;
+let queueToken = 0;
+const queue = new BackgroundUploadQueue(queueStorage, {
+  now: () => queueNow,
+  leaseMs: 1_000,
+  token: () => `lease-${++queueToken}`,
+});
+await Promise.all([queue.enqueue('queue-a'), queue.enqueue('queue-b')]);
+const [tabAClaim, tabBClaim] = await Promise.all([
+  queue.claim('tab-a'),
+  queue.claim('tab-b'),
 ]);
-check('queued Content OS draft id is atomically consumed once',
-  [takenFirst, takenSecond].filter(Boolean).length === 1 &&
-  queuedStorage.values.kaitoxAutoUploadDraftId === undefined);
+check('two tabs atomically claim different items from the durable multi-item queue',
+  tabAClaim.status === 'claimed' && tabBClaim.status === 'claimed' &&
+  new Set([tabAClaim.claim.draftId, tabBClaim.claim.draftId]).size === 2);
+const thirdTab = await queue.claim('tab-c');
+check('a third tab cannot steal either active lease', thirdTab.status === 'wait');
 
-const autoRunStorage = makeStorage();
-autoRunStorage.values.kaitoxAutoUploadDraftId = 'task-7-auto-run';
+const leaseGuardDraft = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({ id: 'lease-guard-draft' }),
+});
+const leaseGuardClaim = { draftId: 'lease-guard-draft', token: 'lease-guard', leaseExpiresAt: Date.now() + 1_000 };
+let leaseGuardRenewals = 0;
+const leaseGuardQueueClient = {
+  async claim() { return { status: 'claimed', claim: leaseGuardClaim }; },
+  async renew() { return ++leaseGuardRenewals === 1 ? leaseGuardClaim : undefined; },
+  async complete() { return false; },
+  async fail() { return true; },
+  async status() { return { state: 'active', recoverable: false }; },
+};
+await assert.rejects(() => runQueuedDraftUpload(leaseGuardDraft.draft.id, {
+  ...leaseGuardDraft.deps,
+  queueClient: leaseGuardQueueClient,
+}), /租约已失效/);
+check('a tab that lost its lease stops before any X draft mutation', leaseGuardDraft.uploadCalls.length === 0);
+
+const crashQueueStorage = makeStorage();
+let crashNow = 20_000;
+let crashToken = 0;
+const crashQueue = new BackgroundUploadQueue(crashQueueStorage, {
+  now: () => crashNow,
+  leaseMs: 1_000,
+  token: () => `crash-lease-${++crashToken}`,
+});
+const beforeCrash = await crashQueue.claim('old-tab', 'crash-draft', true);
+crashNow += 1_001;
+const reloadedCrashQueue = new BackgroundUploadQueue(crashQueueStorage, {
+  now: () => crashNow,
+  leaseMs: 1_000,
+  token: () => `crash-lease-${++crashToken}`,
+});
+const afterReload = await reloadedCrashQueue.claim('new-tab', 'crash-draft');
+check('an expired crash lease is atomically reclaimed after reload',
+  beforeCrash.status === 'claimed' && afterReload.status === 'claimed' &&
+  beforeCrash.claim.token !== afterReload.claim.token);
+check('the crashed tab cannot renew or finish the replacement lease',
+  await crashQueue.renew('old-tab', beforeCrash.claim) === undefined &&
+  await crashQueue.complete('old-tab', beforeCrash.claim) === false);
+
+const queueClientFor = (backgroundQueue, owner) => ({
+  claim: (draftId) => backgroundQueue.claim(owner, draftId, draftId !== undefined),
+  renew: (claim) => backgroundQueue.renew(owner, claim),
+  complete: (claim) => backgroundQueue.complete(owner, claim),
+  fail: (claim) => backgroundQueue.fail(owner, claim),
+  status: (draftId) => backgroundQueue.status(draftId),
+});
+
+const autoQueueStorage = makeStorage();
+const autoQueue = new BackgroundUploadQueue(autoQueueStorage, { token: () => 'auto-lease' });
+await autoQueue.enqueue('task-7-auto-run');
 const autoRun = makeAutoUploadDeps({ draft: makeAutoUploadDraft({ id: 'task-7-auto-run' }) });
 const { client: autoRunClient, ...autoRunUploadDeps } = autoRun.deps;
 const autoNavigations = [];
 const autoRunResult = await runAutoUploadFromQueue({
   pathname: '/compose/articles',
-  storage: autoRunStorage,
+  queueClient: queueClientFor(autoQueue, 'auto-tab'),
   getClient: async () => autoRunClient,
   uploadDeps: autoRunUploadDeps,
   navigate: (url) => autoNavigations.push(url),
 });
 check('content auto-upload navigates only to the verified exact edit URL',
   autoRunResult?.restId === 'REST_TASK_7' &&
-  JSON.stringify(autoNavigations) === JSON.stringify([
-    'https://x.com/compose/articles/edit/REST_TASK_7',
-  ]));
+  JSON.stringify(autoNavigations) === JSON.stringify(['https://x.com/compose/articles/edit/REST_TASK_7']));
 
-const failedAutoRunStorage = makeStorage();
-failedAutoRunStorage.values.kaitoxAutoUploadDraftId = 'task-7-auto-fail';
+const doneReplayQueue = new BackgroundUploadQueue(makeStorage(), { token: () => 'done-replay-lease' });
+await doneReplayQueue.enqueue('task-7-done-replay');
+const doneReplay = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({
+    id: 'task-7-done-replay',
+    status: 'done',
+    targetHandle: '@aaxiaoshi666',
+    restId: 'REST_DONE_REPLAY',
+    editUrl: 'https://x.com/compose/articles/edit/REST_DONE_REPLAY',
+  }),
+  activeHref: '/other',
+});
+const { client: doneReplayClient, ...doneReplayUploadDeps } = doneReplay.deps;
+const doneReplayNavigations = [];
+await assert.rejects(() => runAutoUploadFromQueue({
+  pathname: '/compose/articles',
+  queueClient: queueClientFor(doneReplayQueue, 'done-replay-tab'),
+  getClient: async () => doneReplayClient,
+  uploadDeps: doneReplayUploadDeps,
+  navigate: (url) => doneReplayNavigations.push(url),
+}), /当前 X 账号/);
+check('automatic done replay rechecks the active account before navigation', doneReplayNavigations.length === 0);
+
+const staleQueue = new BackgroundUploadQueue(makeStorage(), { token: () => 'stale-lease' });
+const staleQueueClient = queueClientFor(staleQueue, 'panel-tab');
+const staleDraft = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({ id: 'stale-uploading', status: 'uploading' }),
+});
+check('panel recovery status marks an unleased remote uploading draft recoverable',
+  (await getUploadQueueStatus(staleDraft.draft.id, staleQueueClient)).recoverable === true);
+const staleUploadResult = await runQueuedDraftUpload(staleDraft.draft.id, {
+  ...staleDraft.deps,
+  queueClient: staleQueueClient,
+});
+check('panel recovery claims stale uploading and resumes it through the same strict path',
+  staleUploadResult.restId === 'REST_TASK_7' &&
+  (await getUploadQueueStatus(staleDraft.draft.id, staleQueueClient)).state === 'absent');
+
+const failedQueue = new BackgroundUploadQueue(makeStorage(), { token: () => 'failed-lease' });
+await failedQueue.enqueue('task-7-auto-fail');
 const failedAutoRun = makeAutoUploadDeps({
   draft: makeAutoUploadDraft({ id: 'task-7-auto-fail' }),
   activeHref: '/other',
 });
 const { client: failedAutoClient, ...failedAutoUploadDeps } = failedAutoRun.deps;
 const failedNavigations = [];
-await assert.rejects(
-  () => runAutoUploadFromQueue({
-    pathname: '/compose/articles',
-    storage: failedAutoRunStorage,
-    getClient: async () => failedAutoClient,
-    uploadDeps: failedAutoUploadDeps,
-    navigate: (url) => failedNavigations.push(url),
-  }),
-  /当前 X 账号/,
-);
+await assert.rejects(() => runAutoUploadFromQueue({
+  pathname: '/compose/articles',
+  queueClient: queueClientFor(failedQueue, 'failed-tab'),
+  getClient: async () => failedAutoClient,
+  uploadDeps: failedAutoUploadDeps,
+  navigate: (url) => failedNavigations.push(url),
+}), /当前 X 账号/);
 check('failed content auto-upload leaves a retryable failed relay task and never navigates',
-  failedAutoRun.draft.status === 'failed' &&
-  failedAutoRunStorage.values.kaitoxAutoUploadDraftId === undefined &&
-  failedNavigations.length === 0);
+  failedAutoRun.draft.status === 'failed' && failedNavigations.length === 0);
 
 // ---- 0. X 前端 queryId 动态发现 ----
 console.log('\n[0] X 前端 queryId 发现 + 缓存 + 单次刷新');
@@ -1455,6 +1621,7 @@ try {
     }),
     storageLocal: recoveryStorage,
     tabs: { async create(value) { recoveryTabs.push(value); } },
+    uploadQueue: { async enqueue() {} },
   };
   await assert.rejects(
     () => enqueueContentOsHandoff(compatibilityFixture.manifest, recoveryDeps),

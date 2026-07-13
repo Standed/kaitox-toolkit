@@ -15,6 +15,7 @@ import {
   type XArticleHandoffManifest,
 } from './content-os-protocol.js';
 import { getSettings } from './xsession.js';
+import { getBackgroundUploadQueue } from './upload-queue.js';
 
 const DOWNLOAD_CONCURRENCY = 3;
 const X_ARTICLES_URL = 'https://x.com/compose/articles';
@@ -40,6 +41,11 @@ export interface ContentOsBackgroundDependencies {
   fetchImpl: typeof fetch;
   storageLocal: LocalStorageArea;
   tabs: TabCreator;
+  uploadQueue?: Pick<ReturnType<typeof getBackgroundUploadQueue>, 'enqueue'>;
+}
+
+function uploadQueue(dependencies: ContentOsBackgroundDependencies) {
+  return dependencies.uploadQueue ?? getBackgroundUploadQueue();
 }
 
 type HandoffReplayStage = 'relay-enqueued' | 'tab-opened';
@@ -256,6 +262,7 @@ async function enqueueValidatedHandoff(
     if (!stored || stored.handoffId !== manifest.handoffId || stored.fingerprint !== fingerprint) {
       throw new ContentOsBridgeError('HANDOFF_REPLAY_CONFLICT');
     }
+    await uploadQueue(dependencies).enqueue(stored.draftId);
     if (stored.stage === 'relay-enqueued') {
       await openXArticlesTab(storageKey, stored, dependencies);
     }
@@ -320,8 +327,8 @@ async function enqueueValidatedHandoff(
   };
   await dependencies.storageLocal.set({
     [storageKey]: record,
-    kaitoxAutoUploadDraftId: draftId,
   });
+  await uploadQueue(dependencies).enqueue(draftId);
   await openXArticlesTab(storageKey, record, dependencies);
   return { draftId };
 }

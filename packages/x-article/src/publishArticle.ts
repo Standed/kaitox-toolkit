@@ -31,6 +31,27 @@ export type PublishProgress =
   | { stage: 'draft' }
   | { stage: 'cover' };
 
+export type PublishCheckpointStage =
+  | 'draft-created'
+  | 'title-updated'
+  | 'images-uploaded'
+  | 'content-updated'
+  | 'cover-uploaded'
+  | 'cover-updated';
+
+export interface PublishArticleCheckpoint {
+  stage: PublishCheckpointStage;
+  restId: string;
+  mediaMap: Record<string, string>;
+  coverMediaId?: string;
+}
+
+export interface PublishArticleResume {
+  restId: string;
+  mediaMap?: Record<string, string>;
+  coverMediaId?: string;
+}
+
 export interface PublishArticleParams {
   markdown: string;
   /** 文章标题。不传则取 markdown 里的第一个标题，再退化为空串。 */
@@ -48,6 +69,10 @@ export interface PublishArticleParams {
   imageConcurrency?: number;
   /** 进度回调（可选，只供 UI 展示；回调抛错不影响上传流程）。 */
   onProgress?: (progress: PublishProgress) => void;
+  /** Resume an already-created remote draft. Mutations are safe to repeat on the same rest_id. */
+  resume?: PublishArticleResume;
+  /** Durable recovery checkpoint. Unlike progress callbacks, failures stop the pipeline. */
+  onCheckpoint?: (checkpoint: PublishArticleCheckpoint) => Promise<void> | void;
 }
 
 export interface PublishArticleResult {
@@ -85,29 +110,64 @@ export async function publishXArticle(params: PublishArticleParams): Promise<Pub
 
   const title = params.title ?? deriveTitle(markdown);
 
+  let checkpointWrite: Promise<void> = Promise.resolve();
+
+  const checkpoint = async (
+    stage: PublishCheckpointStage,
+    restId: string,
+    mediaMap: Record<string, string>,
+    coverMediaId?: string,
+  ) => {
+    const snapshot: PublishArticleCheckpoint = {
+      stage,
+      restId,
+      mediaMap: { ...mediaMap },
+      coverMediaId,
+    };
+    checkpointWrite = checkpointWrite.then(async () => params.onCheckpoint?.(snapshot));
+    await checkpointWrite;
+  };
+
   // 1：先创建空白草稿，不允许用 HTTP 200 或类似成功文案代替真实 rest_id。
-  notify({ stage: 'draft' });
-  const { restId, raw } = await client.createEmptyArticleDraft();
+  let restId = params.resume?.restId.trim() ?? '';
+  let raw: any;
+  if (!restId) {
+    notify({ stage: 'draft' });
+    const created = await client.createEmptyArticleDraft();
+    restId = created.restId ?? '';
+    raw = created.raw;
+  }
   if (!restId) throw new Error('X 未返回真实 rest_id');
+
+  const srcs = collectImageSources(markdown);
+  const allowedSources = new Set(srcs);
+  const mediaMap: Record<string, string> = {};
+  for (const [src, mediaId] of Object.entries(params.resume?.mediaMap ?? {})) {
+    if (allowedSources.has(src) && typeof mediaId === 'string' && mediaId.trim()) mediaMap[src] = mediaId;
+  }
+  await checkpoint('draft-created', restId, mediaMap, params.resume?.coverMediaId);
 
   // 2：标题必须在正文和封面之前成功。
   await client.updateArticleTitle(restId, title);
+  await checkpoint('title-updated', restId, mediaMap, params.resume?.coverMediaId);
 
   // 3：收集并严格上传全部正文图。
-  const srcs = collectImageSources(markdown);
-  const mediaMap: Record<string, string> = {};
-
-  let imagesDone = 0;
-  notify({ stage: 'images', done: 0, total: srcs.length });
-  await mapLimit(srcs, imageConcurrency, async (src) => {
+  let imagesDone = srcs.filter((src) => mediaMap[src]).length;
+  notify({ stage: 'images', done: imagesDone, total: srcs.length });
+  const missingSources = srcs.filter((src) => !mediaMap[src]);
+  await mapLimit(missingSources, imageConcurrency, async (src) => {
     try {
       const { bytes, mimeType } = await fetchImage(src);
       mediaMap[src] = await client.uploadMedia(bytes, mimeType, 'tweet_image');
+      await checkpoint('images-uploaded', restId, mediaMap, params.resume?.coverMediaId);
     } finally {
       imagesDone += 1;
       notify({ stage: 'images', done: imagesDone, total: srcs.length });
     }
   });
+  if (missingSources.length === 0) {
+    await checkpoint('images-uploaded', restId, mediaMap, params.resume?.coverMediaId);
+  }
 
   // 4：markdown → content_state，并更新正文。
   const {
@@ -118,14 +178,19 @@ export async function publishXArticle(params: PublishArticleParams): Promise<Pub
     throw new Error(`正文图未全部解析：${unresolvable.join(', ')}`);
   }
   await client.updateArticleContent(restId, contentState);
+  await checkpoint('content-updated', restId, mediaMap, params.resume?.coverMediaId);
 
   // 5：设封面（可选）。下载、上传或 GraphQL 失败都直接向上抛。
-  let coverMediaId: string | undefined;
+  let coverMediaId = params.resume?.coverMediaId;
   if (params.fetchCover) {
     notify({ stage: 'cover' });
-    const { bytes, mimeType } = await params.fetchCover();
-    coverMediaId = await client.uploadMedia(bytes, mimeType, 'tweet_image');
+    if (!coverMediaId) {
+      const { bytes, mimeType } = await params.fetchCover();
+      coverMediaId = await client.uploadMedia(bytes, mimeType, 'tweet_image');
+      await checkpoint('cover-uploaded', restId, mediaMap, coverMediaId);
+    }
     await client.updateCoverMedia(restId, coverMediaId);
+    await checkpoint('cover-updated', restId, mediaMap, coverMediaId);
   }
 
   return {

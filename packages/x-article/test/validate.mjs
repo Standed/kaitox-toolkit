@@ -301,12 +301,14 @@ const successResponses = {
 };
 
 const strictCalls = [];
+const strictCheckpoints = [];
 const strictResult = await publishXArticle({
   markdown: '# 标题\n\n正文\n\n![图](body.png)\n',
   credentials: { bearerToken: '', csrfToken: 'CT0' },
   clientOptions: { fetchImpl: makeGraphqlMock(strictCalls, successResponses), queryIds: QUERY_IDS },
   fetchImage: async () => ({ bytes: new Uint8Array([1]), mimeType: 'image/png' }),
   fetchCover: async () => ({ bytes: new Uint8Array([2]), mimeType: 'image/png' }),
+  onCheckpoint: async (checkpoint) => strictCheckpoints.push(checkpoint),
 });
 const graphCalls = strictCalls.filter((call) => call.url.includes('/i/api/graphql/'));
 check(
@@ -317,6 +319,17 @@ check(
 check('GraphQL 链路不调用 publish mutation', graphCalls.every((call) => !/publish/i.test(operationName(call.url))));
 check('strict publish 返回真实 restId', strictResult.restId === 'ART_777');
 check('strict publish 返回精确编辑链接', strictResult.editUrl === 'https://x.com/compose/articles/edit/ART_777');
+check(
+  '严格流水线按远端阶段写出可恢复检查点',
+  JSON.stringify(strictCheckpoints.map((checkpoint) => checkpoint.stage)) === JSON.stringify([
+    'draft-created',
+    'title-updated',
+    'images-uploaded',
+    'content-updated',
+    'cover-uploaded',
+    'cover-updated',
+  ]),
+);
 const createCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityDraftCreate');
 const titleCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityUpdateTitle');
 const contentCall = graphCalls.find((call) => operationName(call.url) === 'ArticleEntityUpdateContent');
@@ -340,6 +353,25 @@ const titleIndex = strictCalls.indexOf(titleCall);
 const bodyUploadIndex = strictCalls.findIndex((call) => call.url.includes('command=INIT'));
 const contentIndex = strictCalls.indexOf(contentCall);
 check('title 成功后才上传正文图，正文图完成后再更新 content', titleIndex >= 0 && bodyUploadIndex > titleIndex && contentIndex > bodyUploadIndex);
+
+const resumeCalls = [];
+const resumed = await publishXArticle({
+  markdown: '# 标题\n\n正文\n\n![图](body.png)\n',
+  credentials: { bearerToken: '', csrfToken: 'CT0' },
+  clientOptions: { fetchImpl: makeGraphqlMock(resumeCalls, successResponses), queryIds: QUERY_IDS },
+  fetchImage: async () => { throw new Error('resumed body media must not upload twice'); },
+  fetchCover: async () => { throw new Error('resumed cover media must not upload twice'); },
+  resume: {
+    restId: 'ART_EXISTING',
+    mediaMap: { 'body.png': 'MEDIA_EXISTING' },
+    coverMediaId: 'COVER_EXISTING',
+  },
+});
+check('恢复已有 rest_id 时不会再次创建 X 草稿',
+  resumed.restId === 'ART_EXISTING' &&
+  resumeCalls.every((call) => operationName(call.url) !== 'ArticleEntityDraftCreate'));
+check('恢复已有媒体检查点时不会重复上传正文图或封面',
+  resumeCalls.every((call) => !String(call.url).includes('command=INIT')));
 
 const graphqlErrorClient = new XArticleClient(
   { bearerToken: '', csrfToken: 'CT0' },

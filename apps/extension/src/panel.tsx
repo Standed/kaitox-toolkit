@@ -12,7 +12,7 @@ import { createPortal } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import type { DraftListItem, DraftStatus, HttpRelayClient, StyleReport } from '@kaitox/relay-protocol';
 import { getRelayClient, getSettings } from './xsession.js';
-import { uploadQueuedDraft } from './auto-upload.js';
+import { getUploadQueueStatus, runQueuedDraftUpload } from './auto-upload.js';
 import { LOGO_SVG } from './logo.js';
 import {
   CheckIcon,
@@ -152,6 +152,7 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [spin, setSpin] = useState(0); // 刷新按钮累计旋转角度
   const [uploads, setUploads] = useState<Record<string, UploadState>>({});
+  const [recoverableUploads, setRecoverableUploads] = useState<Record<string, boolean>>({});
   const [relayAddr, setRelayAddr] = useState('');
   const clientRef = useRef<HttpRelayClient | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -180,6 +181,15 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
       const list = (await clientRef.current.listDrafts())
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
       setItems(list);
+      const uploading = list.filter((draft) => draft.status === 'uploading');
+      const recovery = await Promise.all(uploading.map(async (draft) => {
+        try {
+          return [draft.id, (await getUploadQueueStatus(draft.id)).recoverable] as const;
+        } catch {
+          return [draft.id, false] as const;
+        }
+      }));
+      setRecoverableUploads(Object.fromEntries(recovery));
       setConn('ok');
     } catch (err: any) {
       setConn('error');
@@ -293,7 +303,7 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
       setTab('uploading');
       setPage(1);
       try {
-        const result = await uploadQueuedDraft(id, {
+        const result = await runQueuedDraftUpload(id, {
           client,
           onProgress: (message) => {
             setUploads((u) => ({ ...u, [id]: { phase: 'uploading', message } }));
@@ -534,6 +544,7 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
                   bundles={bundles}
                   assetUrls={assetUrls}
                   uploadState={uploads[selected.id]}
+                  recoverable={recoverableUploads[selected.id] === true}
                   disabled={conn !== 'ok'}
                   onClose={() => setSelectedId(null)}
                   onUpload={() => void doUpload(selected.id)}
@@ -585,6 +596,8 @@ interface DetailViewProps {
   bundles: BundleCache;
   assetUrls: AssetUrls;
   uploadState?: UploadState;
+  /** Relay says uploading, but no live background lease owns it. */
+  recoverable: boolean;
   /** relay 断连时禁用全部操作。 */
   disabled: boolean;
   onClose: () => void;
@@ -603,6 +616,7 @@ function DetailView({
   bundles,
   assetUrls,
   uploadState,
+  recoverable,
   disabled,
   onClose,
   onUpload,
@@ -710,6 +724,8 @@ function DetailView({
     };
   } else if (status === 'failed') {
     note = { text: `上一次上传失败${bundle?.error ? `：${bundle.error}` : ''}`, kind: 'error' };
+  } else if (status === 'uploading' && recoverable) {
+    note = { text: '上次上传已中断，可从检查点恢复', kind: 'info' };
   }
 
   return (
@@ -871,14 +887,20 @@ function DetailView({
 
       <div className="kx-actions">
         {note && <div className={`kx-note kx-note-${note.kind}`}>{note.text}</div>}
-        {(status === 'pending' || status === 'failed' || uploading) && (
+        {(status === 'pending' || status === 'failed' || uploading || (status === 'uploading' && recoverable)) && (
           <button
             className="kx-btn-primary"
             type="button"
-            disabled={disabled || uploading || delPhase === 'deleting'}
+            disabled={disabled || uploading || (status === 'uploading' && !recoverable) || delPhase === 'deleting'}
             onClick={onUpload}
           >
-            {uploading ? '上传中…' : status === 'failed' ? '重试上传' : '上传草稿'}
+            {uploading
+              ? '上传中…'
+              : status === 'uploading'
+                ? '恢复上传'
+                : status === 'failed'
+                  ? '重试上传'
+                  : '上传草稿'}
           </button>
         )}
         <button className="kx-btn-gray" type="button" disabled={!bundle} onClick={() => void doCopy()}>

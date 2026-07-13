@@ -1,7 +1,9 @@
 /** service worker：可选的角标计数，显示 relay 里有几份待上传草稿。 */
 import { DEFAULT_RELAY_BASE } from './xsession.js';
 import { registerContentOsBackgroundHandlers } from './content-os-background.js';
+import { registerUploadQueueBackgroundHandlers } from './upload-queue.js';
 
+registerUploadQueueBackgroundHandlers();
 registerContentOsBackgroundHandlers();
 
 // 点工具栏图标：任意页面弹出右侧设置浮窗。

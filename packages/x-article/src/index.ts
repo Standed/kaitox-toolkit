@@ -43,6 +43,9 @@ export type {
   PublishArticleParams,
   PublishArticleResult,
   PublishProgress,
+  PublishCheckpointStage,
+  PublishArticleCheckpoint,
+  PublishArticleResume,
   ImageFetcher,
   CoverFetcher,
 } from './publishArticle.js';
