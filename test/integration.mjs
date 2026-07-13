@@ -862,9 +862,6 @@ const memoryCheckpointStore = () => {
   const values = new Map();
   return {
     values,
-    async get(id) { return values.get(id); },
-    async set(id, checkpoint) { values.set(id, checkpoint); },
-    async remove(id) { values.delete(id); },
   };
 };
 
@@ -878,6 +875,7 @@ const makeAutoUploadDeps = ({
 } = {}) => {
   const acks = [];
   const uploadCalls = [];
+  const claim = { draftId: draft.id, token: 'memory-claim', leaseExpiresAt: Number.MAX_SAFE_INTEGER };
   let doneAckFailures = failDoneAck ? 1 : 0;
   const client = {
     async getDraft() {
@@ -897,10 +895,22 @@ const makeAutoUploadDeps = ({
       if (patch.status === 'failed') draft.error = patch.error;
     },
   };
+  const queueClient = {
+    async claim() { return { status: 'claimed', claim }; },
+    async renew() { return claim; },
+    async complete() { return true; },
+    async fail() { return true; },
+    async status() { return { state: 'active', recoverable: false }; },
+    async getCheckpoint() { return checkpointStore.values.get(draft.id); },
+    async setCheckpoint(_claim, checkpoint) { checkpointStore.values.set(draft.id, checkpoint); },
+    async removeCheckpoint() { checkpointStore.values.delete(draft.id); },
+  };
   return {
     deps: {
       client,
-      checkpointStore,
+      queueClient,
+      getClaim: () => claim,
+      assertLease: async () => {},
       assertTargetHandle: (bundle) => assertActiveTargetHandle(bundle, {
         timeoutMs: 0,
         readProfileHref: () => activeHref,
@@ -1022,6 +1032,41 @@ const crashRecoveredResult = await uploadQueuedDraft(crashRecovery.draft.id, cra
 check('reload resumes the checkpointed rest_id instead of creating another X draft',
   crashRecoveredResult.restId === 'REST_AFTER_CRASH' && remoteDraftCreates === 1 && crashRecovery.uploadCalls.length === 2);
 
+let indeterminateCreates = 0;
+const indeterminateCreate = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({ id: 'indeterminate-create' }),
+  uploadImpl: async (_bundle, _client, _progress, options) => {
+    await options.onCheckpoint({ stage: 'create-started', mediaMap: {} });
+    indeterminateCreates++;
+    await options.onCheckpoint({
+      stage: 'draft-created',
+      restId: 'REST_CHECKPOINT_LOST',
+      mediaMap: {},
+    });
+    return { restId: 'REST_CHECKPOINT_LOST', skippedImages: [] };
+  },
+});
+const setIndeterminateCheckpoint = indeterminateCreate.deps.queueClient.setCheckpoint;
+let indeterminateCheckpointWrites = 0;
+indeterminateCreate.deps.queueClient.setCheckpoint = async (...args) => {
+  indeterminateCheckpointWrites++;
+  if (indeterminateCheckpointWrites === 2) throw new Error('simulated first rest_id checkpoint failure');
+  return setIndeterminateCheckpoint(...args);
+};
+await assert.rejects(
+  () => uploadQueuedDraft(indeterminateCreate.draft.id, indeterminateCreate.deps),
+  /first rest_id checkpoint failure/,
+);
+check('create-started is durable before ArticleEntityDraftCreate becomes indeterminate',
+  indeterminateCreate.checkpointStore.values.get(indeterminateCreate.draft.id)?.stage === 'create-started' &&
+  indeterminateCreates === 1);
+await assert.rejects(
+  () => uploadQueuedDraft(indeterminateCreate.draft.id, indeterminateCreate.deps),
+  /必须人工核对 X Articles/,
+);
+check('recovery from create-started without rest_id fails closed and never auto-creates again',
+  indeterminateCreates === 1 && indeterminateCreate.uploadCalls.length === 1);
+
 const corruptCheckpoint = makeAutoUploadDeps();
 corruptCheckpoint.checkpointStore.values.set(corruptCheckpoint.draft.id, {
   version: 2,
@@ -1094,13 +1139,69 @@ check('the crashed tab cannot renew or finish the replacement lease',
   await crashQueue.renew('old-tab', beforeCrash.claim) === undefined &&
   await crashQueue.complete('old-tab', beforeCrash.claim) === false);
 
+await crashQueue.setCheckpoint('new-tab', afterReload.claim, { stage: 'new-owner' });
+await assert.rejects(
+  () => crashQueue.setCheckpoint('old-tab', beforeCrash.claim, { stage: 'stale-owner' }),
+  /租约已失效/,
+);
+await assert.rejects(
+  () => crashQueue.removeCheckpoint('old-tab', beforeCrash.claim),
+  /租约已失效/,
+);
+check('a stale owner cannot overwrite or remove the replacement checkpoint',
+  (await crashQueue.getCheckpoint('new-tab', afterReload.claim))?.stage === 'new-owner' &&
+  await crashQueue.fail('old-tab', beforeCrash.claim) === false);
+
 const queueClientFor = (backgroundQueue, owner) => ({
   claim: (draftId) => backgroundQueue.claim(owner, draftId, draftId !== undefined),
   renew: (claim) => backgroundQueue.renew(owner, claim),
   complete: (claim) => backgroundQueue.complete(owner, claim),
   fail: (claim) => backgroundQueue.fail(owner, claim),
   status: (draftId) => backgroundQueue.status(draftId),
+  getCheckpoint: (claim) => backgroundQueue.getCheckpoint(owner, claim),
+  setCheckpoint: (claim, checkpoint) => backgroundQueue.setCheckpoint(owner, claim, checkpoint),
+  removeCheckpoint: (claim) => backgroundQueue.removeCheckpoint(owner, claim),
 });
+
+const takeoverStorage = makeStorage();
+let takeoverNow = 30_000;
+let takeoverToken = 0;
+const takeoverQueue = new BackgroundUploadQueue(takeoverStorage, {
+  now: () => takeoverNow,
+  leaseMs: 100,
+  token: () => `takeover-${++takeoverToken}`,
+});
+const takeoverDraft = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({ id: 'takeover-race' }),
+});
+let releaseOldMutation;
+const oldMutationReleased = new Promise((resolve) => { releaseOldMutation = resolve; });
+let firstMutationStarted;
+const firstMutation = new Promise((resolve) => { firstMutationStarted = resolve; });
+let oldRemoteMutations = 0;
+takeoverDraft.deps.uploadDraft = async (_bundle, _client, _progress, options) => {
+  await options.beforeRemoteMutation();
+  oldRemoteMutations++;
+  firstMutationStarted();
+  await oldMutationReleased;
+  await options.beforeRemoteMutation();
+  oldRemoteMutations++;
+  return { restId: 'STALE_RESULT', skippedImages: [] };
+};
+const oldOwnerRun = runQueuedDraftUpload(takeoverDraft.draft.id, {
+  ...takeoverDraft.deps,
+  queueClient: queueClientFor(takeoverQueue, 'old-owner'),
+  renewMs: 60_000,
+});
+await firstMutation;
+takeoverNow += 101;
+const replacementClaim = await takeoverQueue.claim('new-owner', takeoverDraft.draft.id);
+releaseOldMutation();
+await assert.rejects(() => oldOwnerRun, /租约已失效/);
+check('after takeover the stale owner performs no further X mutation or failed/done relay ack',
+  replacementClaim.status === 'claimed' &&
+  oldRemoteMutations === 1 &&
+  takeoverDraft.acks.filter((patch) => patch.status === 'failed' || patch.status === 'done').length === 0);
 
 const autoQueueStorage = makeStorage();
 const autoQueue = new BackgroundUploadQueue(autoQueueStorage, { token: () => 'auto-lease' });
@@ -1408,6 +1509,7 @@ const staleIds = allQueryIds('STALE');
 const freshIds = allQueryIds('FRESH');
 const retryCalls = [];
 let refreshCount = 0;
+let mutationFences = 0;
 const retryingFetch = createQueryIdRefreshingFetch(
   async (url, init) => {
     retryCalls.push({ url, body: init?.body });
@@ -1420,6 +1522,7 @@ const retryingFetch = createQueryIdRefreshingFetch(
     refreshCount++;
     return freshIds;
   },
+  async () => { mutationFences++; },
 );
 await retryingFetch(
   `https://x.com/i/api/graphql/${staleIds.ArticleEntityUpdateTitle}/ArticleEntityUpdateTitle`,
@@ -1429,6 +1532,7 @@ check('GraphQL 404 只刷新一次并重试同一 operation',
   refreshCount === 1 && retryCalls.length === 2 &&
     retryCalls[1].url.includes(`/${freshIds.ArticleEntityUpdateTitle}/ArticleEntityUpdateTitle`),
 );
+check('queryId refresh retry fences both remote mutation attempts', mutationFences === 2);
 check('刷新后同步 URL、body 和后续 operation 映射',
   retryCalls[1] && JSON.parse(retryCalls[1].body).queryId === freshIds.ArticleEntityUpdateTitle &&
     staleIds.ArticleEntityUpdateContent === freshIds.ArticleEntityUpdateContent,

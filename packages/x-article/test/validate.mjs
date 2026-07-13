@@ -302,10 +302,20 @@ const successResponses = {
 
 const strictCalls = [];
 const strictCheckpoints = [];
+const strictFetch = makeGraphqlMock(strictCalls, successResponses);
 const strictResult = await publishXArticle({
   markdown: '# 标题\n\n正文\n\n![图](body.png)\n',
   credentials: { bearerToken: '', csrfToken: 'CT0' },
-  clientOptions: { fetchImpl: makeGraphqlMock(strictCalls, successResponses), queryIds: QUERY_IDS },
+  clientOptions: {
+    fetchImpl: async (...args) => {
+      if (operationName(args[0]) === 'ArticleEntityDraftCreate'
+        && strictCheckpoints.at(-1)?.stage !== 'create-started') {
+        throw new Error('create-started checkpoint must precede ArticleEntityDraftCreate');
+      }
+      return strictFetch(...args);
+    },
+    queryIds: QUERY_IDS,
+  },
   fetchImage: async () => ({ bytes: new Uint8Array([1]), mimeType: 'image/png' }),
   fetchCover: async () => ({ bytes: new Uint8Array([2]), mimeType: 'image/png' }),
   onCheckpoint: async (checkpoint) => strictCheckpoints.push(checkpoint),
@@ -322,6 +332,7 @@ check('strict publish 返回精确编辑链接', strictResult.editUrl === 'https
 check(
   '严格流水线按远端阶段写出可恢复检查点',
   JSON.stringify(strictCheckpoints.map((checkpoint) => checkpoint.stage)) === JSON.stringify([
+    'create-started',
     'draft-created',
     'title-updated',
     'images-uploaded',

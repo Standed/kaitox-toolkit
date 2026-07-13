@@ -32,6 +32,7 @@ export type PublishProgress =
   | { stage: 'cover' };
 
 export type PublishCheckpointStage =
+  | 'create-started'
   | 'draft-created'
   | 'title-updated'
   | 'images-uploaded'
@@ -39,12 +40,18 @@ export type PublishCheckpointStage =
   | 'cover-uploaded'
   | 'cover-updated';
 
-export interface PublishArticleCheckpoint {
-  stage: PublishCheckpointStage;
-  restId: string;
-  mediaMap: Record<string, string>;
-  coverMediaId?: string;
-}
+export type PublishArticleCheckpoint =
+  | {
+    stage: 'create-started';
+    mediaMap: Record<string, string>;
+    coverMediaId?: undefined;
+  }
+  | {
+    stage: Exclude<PublishCheckpointStage, 'create-started'>;
+    restId: string;
+    mediaMap: Record<string, string>;
+    coverMediaId?: string;
+  };
 
 export interface PublishArticleResume {
   restId: string;
@@ -114,16 +121,18 @@ export async function publishXArticle(params: PublishArticleParams): Promise<Pub
 
   const checkpoint = async (
     stage: PublishCheckpointStage,
-    restId: string,
+    restId: string | undefined,
     mediaMap: Record<string, string>,
     coverMediaId?: string,
   ) => {
-    const snapshot: PublishArticleCheckpoint = {
-      stage,
-      restId,
-      mediaMap: { ...mediaMap },
-      coverMediaId,
-    };
+    const snapshot: PublishArticleCheckpoint = stage === 'create-started'
+      ? { stage, mediaMap: {} }
+      : {
+        stage,
+        restId: restId ?? '',
+        mediaMap: { ...mediaMap },
+        coverMediaId,
+      };
     checkpointWrite = checkpointWrite.then(async () => params.onCheckpoint?.(snapshot));
     await checkpointWrite;
   };
@@ -133,6 +142,7 @@ export async function publishXArticle(params: PublishArticleParams): Promise<Pub
   let raw: any;
   if (!restId) {
     notify({ stage: 'draft' });
+    await checkpoint('create-started', undefined, {});
     const created = await client.createEmptyArticleDraft();
     restId = created.restId ?? '';
     raw = created.raw;

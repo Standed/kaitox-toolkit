@@ -31,6 +31,7 @@ export type DraftAssetReader = Pick<RelayClient, 'getAsset'>;
 export interface UploadDraftOptions {
   resume?: PublishArticleResume;
   onCheckpoint?: (checkpoint: PublishArticleCheckpoint) => Promise<void> | void;
+  beforeRemoteMutation?: () => Promise<void>;
 }
 
 export async function uploadDraft(
@@ -46,6 +47,7 @@ export async function uploadDraft(
     window.fetch.bind(window) as any,
     queryIds,
     refreshArticleQueryIds,
+    options.beforeRemoteMutation,
   );
 
   // mermaid 围栏 → 图片引用；先串行预渲染，语法错误在上传前就报清楚（不半途丢图）。

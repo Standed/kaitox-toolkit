@@ -10,7 +10,6 @@ import {
 import { uploadDraft, type UploadDraftOptions, type UploadResult } from './uploader.js';
 import { getRelayClient } from './xsession.js';
 
-const CHECKPOINT_KEY_PREFIX = 'kaitoxAutoUploadResult:';
 const REQUIRED_HANDLE = CONTENT_OS_TARGET_HANDLE;
 const REQUIRED_HANDLE_BARE = REQUIRED_HANDLE.slice(1).toLowerCase();
 const PROFILE_LINK_SELECTOR = 'a[data-testid="AppTabBar_Profile_Link"]';
@@ -37,23 +36,22 @@ export interface StrictUploadResult {
 
 type StoredCheckpointStage = PublishArticleCheckpoint['stage'] | 'ready-to-ack';
 
-interface StoredUploadCheckpoint extends StrictUploadResult {
-  version: 2;
+interface StoredUploadCheckpoint {
+  version: 3;
   targetHandle: typeof REQUIRED_HANDLE;
   stage: StoredCheckpointStage;
+  restId?: string;
+  editUrl?: string;
   mediaMap: Record<string, string>;
   coverMediaId?: string;
   updatedAt: string;
 }
 
-export interface UploadCheckpointStore {
-  get(id: string): Promise<unknown>;
-  set(id: string, checkpoint: StoredUploadCheckpoint): Promise<void>;
-  remove(id: string): Promise<void>;
-}
-
 export interface UploadQueuedDraftDeps {
   client: UploadClient;
+  queueClient: UploadQueueClient;
+  getClaim: () => UploadClaim;
+  assertLease: () => Promise<void>;
   assertTargetHandle?: (bundle: DraftBundle) => Promise<string> | string;
   uploadDraft?: (
     bundle: DraftBundle,
@@ -61,9 +59,7 @@ export interface UploadQueuedDraftDeps {
     onProgress?: (message: string) => void,
     options?: UploadDraftOptions,
   ) => Promise<UploadResult>;
-  checkpointStore?: UploadCheckpointStore;
   onProgress?: (message: string) => void;
-  assertLease?: () => Promise<void>;
 }
 
 export interface ActiveTargetHandleOptions {
@@ -74,7 +70,7 @@ export interface ActiveTargetHandleOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-export interface RunQueuedDraftDeps extends UploadQueuedDraftDeps {
+export interface RunQueuedDraftDeps extends Omit<UploadQueuedDraftDeps, 'queueClient' | 'getClaim' | 'assertLease'> {
   queueClient?: UploadQueueClient;
   renewMs?: number;
 }
@@ -85,7 +81,7 @@ export interface RunAutoUploadDeps {
   getClient?: () => Promise<UploadClient>;
   navigate?: (url: string) => void;
   sleep?: (ms: number) => Promise<void>;
-  uploadDeps?: Omit<UploadQueuedDraftDeps, 'client'>;
+  uploadDeps?: Omit<RunQueuedDraftDeps, 'client' | 'queueClient'>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -151,6 +147,7 @@ function readStrictDone(bundle: DraftBundle): StrictUploadResult | undefined {
 }
 
 const CHECKPOINT_STAGES = new Set<StoredCheckpointStage>([
+  'create-started',
   'draft-created',
   'title-updated',
   'images-uploaded',
@@ -177,7 +174,7 @@ function readStoredCheckpoint(value: unknown): StoredUploadCheckpoint | undefine
     && validRestId(restId)
     && value.editUrl === canonicalEditUrl(restId)) {
     return {
-      version: 2,
+      version: 3,
       targetHandle: REQUIRED_HANDLE,
       restId,
       editUrl: canonicalEditUrl(restId),
@@ -188,7 +185,20 @@ function readStoredCheckpoint(value: unknown): StoredUploadCheckpoint | undefine
   }
 
   const mediaMap = readMediaMap(value.mediaMap);
-  if (value.version !== 2
+  if (value.version === 3
+    && value.targetHandle === REQUIRED_HANDLE
+    && value.stage === 'create-started'
+    && value.restId === undefined
+    && value.editUrl === undefined
+    && mediaMap
+    && Object.keys(mediaMap).length === 0
+    && value.coverMediaId === undefined
+    && typeof value.updatedAt === 'string'
+    && Number.isFinite(Date.parse(value.updatedAt))) {
+    return { ...value, mediaMap } as unknown as StoredUploadCheckpoint;
+  }
+
+  if ((value.version !== 2 && value.version !== 3)
     || value.targetHandle !== REQUIRED_HANDLE
     || !validRestId(restId)
     || value.editUrl !== canonicalEditUrl(restId)
@@ -200,31 +210,25 @@ function readStoredCheckpoint(value: unknown): StoredUploadCheckpoint | undefine
     || !Number.isFinite(Date.parse(value.updatedAt))) {
     throw new Error('上传恢复检查点损坏，已拒绝重新创建 X 草稿');
   }
-  return { ...value, restId, mediaMap } as unknown as StoredUploadCheckpoint;
-}
-
-function chromeCheckpointStore(): UploadCheckpointStore {
-  return {
-    async get(id) {
-      const key = `${CHECKPOINT_KEY_PREFIX}${id}`;
-      return (await chrome.storage.local.get(key))[key];
-    },
-    async set(id, checkpoint) {
-      await chrome.storage.local.set({ [`${CHECKPOINT_KEY_PREFIX}${id}`]: checkpoint });
-    },
-    async remove(id) {
-      await chrome.storage.local.remove(`${CHECKPOINT_KEY_PREFIX}${id}`);
-    },
-  };
+  return { ...value, version: 3, restId, mediaMap } as unknown as StoredUploadCheckpoint;
 }
 
 function storedCheckpoint(
   checkpoint: PublishArticleCheckpoint,
   stage: StoredCheckpointStage = checkpoint.stage,
 ): StoredUploadCheckpoint {
+  if (checkpoint.stage === 'create-started') {
+    return {
+      version: 3,
+      targetHandle: REQUIRED_HANDLE,
+      stage,
+      mediaMap: {},
+      updatedAt: new Date().toISOString(),
+    };
+  }
   if (!validRestId(checkpoint.restId)) throw new Error('X 草稿检查点缺少有效 rest_id');
   return {
-    version: 2,
+    version: 3,
     targetHandle: REQUIRED_HANDLE,
     restId: checkpoint.restId,
     editUrl: canonicalEditUrl(checkpoint.restId),
@@ -237,6 +241,10 @@ function storedCheckpoint(
 
 function checkpointResume(checkpoint: StoredUploadCheckpoint | undefined): PublishArticleResume | undefined {
   if (!checkpoint) return undefined;
+  if (checkpoint.stage === 'create-started') {
+    throw new Error('X 草稿创建结果不确定，必须人工核对 X Articles 后再处理，已拒绝自动重建');
+  }
+  if (!checkpoint.restId) throw new Error('上传恢复检查点损坏，已拒绝重新创建 X 草稿');
   return {
     restId: checkpoint.restId,
     mediaMap: checkpoint.mediaMap,
@@ -293,38 +301,48 @@ export async function assertActiveTargetHandle(
 }
 
 export async function uploadQueuedDraft(id: string, deps: UploadQueuedDraftDeps): Promise<StrictUploadResult> {
-  const checkpointStore = deps.checkpointStore ?? chromeCheckpointStore();
+  const activeClaim = () => {
+    const claim = deps.getClaim();
+    if (claim.draftId !== id) throw new Error('上传租约与草稿不匹配');
+    return claim;
+  };
+  const fencedAck = async (patch: DraftAckPatch) => {
+    await deps.assertLease();
+    await deps.client.ack(id, patch);
+  };
   try {
     const bundle = await deps.client.getDraft(id);
     const targetHandle = await (deps.assertTargetHandle ?? assertActiveTargetHandle)(bundle);
     if (targetHandle !== REQUIRED_HANDLE) throw new Error(`当前 X 账号必须是 ${REQUIRED_HANDLE}`);
-    await deps.assertLease?.();
+    await deps.assertLease();
 
     const completed = readStrictDone(bundle);
     if (completed) {
-      await checkpointStore.remove(id);
+      await deps.queueClient.removeCheckpoint(activeClaim());
       return completed;
     }
 
-    await deps.client.ack(id, { status: 'uploading' });
-    const checkpoint = readStoredCheckpoint(await checkpointStore.get(id));
+    await fencedAck({ status: 'uploading' });
+    const checkpoint = readStoredCheckpoint(await deps.queueClient.getCheckpoint(activeClaim()));
     if (checkpoint?.stage === 'ready-to-ack') {
-      await deps.assertLease?.();
-      await deps.client.ack(id, {
+      if (!checkpoint.restId || !checkpoint.editUrl) {
+        throw new Error('上传恢复检查点损坏，已拒绝重新创建 X 草稿');
+      }
+      await fencedAck({
         status: 'done',
         targetHandle: REQUIRED_HANDLE,
         restId: checkpoint.restId,
         editUrl: checkpoint.editUrl,
       });
-      await checkpointStore.remove(id);
+      await deps.queueClient.removeCheckpoint(activeClaim());
       return { restId: checkpoint.restId, editUrl: checkpoint.editUrl };
     }
 
     const result = await (deps.uploadDraft ?? uploadDraft)(bundle, deps.client, deps.onProgress, {
       resume: checkpointResume(checkpoint),
+      beforeRemoteMutation: deps.assertLease,
       onCheckpoint: async (next) => {
-        await checkpointStore.set(id, storedCheckpoint(next));
-        await deps.assertLease?.();
+        await deps.queueClient.setCheckpoint(activeClaim(), storedCheckpoint(next));
       },
     });
     const restId = typeof result.restId === 'string' ? result.restId.trim() : '';
@@ -333,26 +351,26 @@ export async function uploadQueuedDraft(id: string, deps: UploadQueuedDraftDeps)
       throw new Error(`X 草稿不完整，跳过了 ${result.skippedImages.length} 张图片`);
     }
 
-    const latest = readStoredCheckpoint(await checkpointStore.get(id));
+    const latest = readStoredCheckpoint(await deps.queueClient.getCheckpoint(activeClaim()));
     const ready = storedCheckpoint({
       stage: latest?.stage === 'cover-updated' ? 'cover-updated' : 'content-updated',
       restId,
       mediaMap: latest?.mediaMap ?? {},
       coverMediaId: latest?.coverMediaId,
     }, 'ready-to-ack');
-    await checkpointStore.set(id, ready);
-    await deps.assertLease?.();
-    await deps.client.ack(id, {
+    await deps.queueClient.setCheckpoint(activeClaim(), ready);
+    if (!ready.restId || !ready.editUrl) throw new Error('X 草稿检查点缺少有效 rest_id');
+    await fencedAck({
       status: 'done',
       targetHandle: REQUIRED_HANDLE,
       restId: ready.restId,
       editUrl: ready.editUrl,
     });
-    await checkpointStore.remove(id);
+    await deps.queueClient.removeCheckpoint(activeClaim());
     return { restId: ready.restId, editUrl: ready.editUrl };
   } catch (error) {
     const failedPatch: DraftAckPatch = { status: 'failed', error: errorMessage(error) };
-    await deps.client.ack(id, failedPatch).catch(() => {});
+    await fencedAck(failedPatch).catch(() => {});
     throw error;
   }
 }
@@ -379,6 +397,8 @@ async function runClaimedUpload(
     if (leaseError) throw leaseError;
     const result = await uploadQueuedDraft(claim.draftId, {
       ...deps,
+      queueClient,
+      getClaim: () => currentClaim,
       assertLease: async () => {
         await renew();
         if (leaseError) throw leaseError;

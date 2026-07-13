@@ -1,5 +1,6 @@
 const UPLOAD_QUEUE_KEY = 'kaitoxUploadQueue';
 const LEGACY_UPLOAD_SLOT_KEY = 'kaitoxAutoUploadDraftId';
+const CHECKPOINT_KEY_PREFIX = 'kaitoxAutoUploadResult:';
 export const DEFAULT_UPLOAD_LEASE_MS = 30_000;
 export const UPLOAD_QUEUE_MESSAGE_TYPE = 'KAITOX_UPLOAD_QUEUE';
 
@@ -49,6 +50,9 @@ export interface UploadQueueClient {
   complete(claim: UploadClaim): Promise<boolean>;
   fail(claim: UploadClaim): Promise<boolean>;
   status(draftId: string): Promise<UploadQueueStatus>;
+  getCheckpoint(claim: UploadClaim): Promise<unknown>;
+  setCheckpoint(claim: UploadClaim, checkpoint: unknown): Promise<void>;
+  removeCheckpoint(claim: UploadClaim): Promise<void>;
 }
 
 export interface BackgroundUploadQueueOptions {
@@ -130,6 +134,20 @@ export class BackgroundUploadQueue {
     return this.storage.set({ [UPLOAD_QUEUE_KEY]: queue });
   }
 
+  private hasActiveLease(queue: StoredUploadQueue, owner: string, claim: UploadClaim): boolean {
+    const lease = queue.items.find((entry) => entry.draftId === claim.draftId)?.lease;
+    return Boolean(lease
+      && lease.owner === owner
+      && lease.token === claim.token
+      && lease.expiresAt > this.now());
+  }
+
+  private assertActiveLease(queue: StoredUploadQueue, owner: string, claim: UploadClaim): void {
+    if (!this.hasActiveLease(queue, owner, claim)) {
+      throw new Error('上传租约已失效，请从面板恢复');
+    }
+  }
+
   enqueue(draftId: string): Promise<void> {
     return this.serialize(async () => {
       if (!draftId.trim()) throw new Error('draftId 不能为空');
@@ -191,7 +209,7 @@ export class BackgroundUploadQueue {
     return this.serialize(async () => {
       const queue = await this.load();
       const item = queue.items.find((entry) => entry.draftId === claim.draftId);
-      if (!item?.lease || item.lease.owner !== owner || item.lease.token !== claim.token) return undefined;
+      if (!item?.lease || !this.hasActiveLease(queue, owner, claim)) return undefined;
       item.lease.expiresAt = this.now() + this.leaseMs;
       await this.save(queue);
       return { ...claim, leaseExpiresAt: item.lease.expiresAt };
@@ -202,8 +220,7 @@ export class BackgroundUploadQueue {
     return this.serialize(async () => {
       const queue = await this.load();
       const index = queue.items.findIndex((entry) => entry.draftId === claim.draftId);
-      const lease = index >= 0 ? queue.items[index].lease : undefined;
-      if (!lease || lease.owner !== owner || lease.token !== claim.token) return false;
+      if (index < 0 || !this.hasActiveLease(queue, owner, claim)) return false;
       queue.items.splice(index, 1);
       await this.save(queue);
       return true;
@@ -229,6 +246,31 @@ export class BackgroundUploadQueue {
       return { state: 'queued', recoverable: true, leaseExpiresAt: item.lease?.expiresAt };
     });
   }
+
+  getCheckpoint(owner: string, claim: UploadClaim): Promise<unknown> {
+    return this.serialize(async () => {
+      const queue = await this.load();
+      this.assertActiveLease(queue, owner, claim);
+      const key = `${CHECKPOINT_KEY_PREFIX}${claim.draftId}`;
+      return (await this.storage.get(key))[key];
+    });
+  }
+
+  setCheckpoint(owner: string, claim: UploadClaim, checkpoint: unknown): Promise<void> {
+    return this.serialize(async () => {
+      const queue = await this.load();
+      this.assertActiveLease(queue, owner, claim);
+      await this.storage.set({ [`${CHECKPOINT_KEY_PREFIX}${claim.draftId}`]: checkpoint });
+    });
+  }
+
+  removeCheckpoint(owner: string, claim: UploadClaim): Promise<void> {
+    return this.serialize(async () => {
+      const queue = await this.load();
+      this.assertActiveLease(queue, owner, claim);
+      await this.storage.remove(`${CHECKPOINT_KEY_PREFIX}${claim.draftId}`);
+    });
+  }
 }
 
 let backgroundQueue: BackgroundUploadQueue | undefined;
@@ -241,6 +283,8 @@ export function getBackgroundUploadQueue(): BackgroundUploadQueue {
 type UploadQueueRequest =
   | { type: typeof UPLOAD_QUEUE_MESSAGE_TYPE; action: 'claim'; draftId?: string }
   | { type: typeof UPLOAD_QUEUE_MESSAGE_TYPE; action: 'renew' | 'complete' | 'fail'; claim: UploadClaim }
+  | { type: typeof UPLOAD_QUEUE_MESSAGE_TYPE; action: 'checkpoint-get' | 'checkpoint-remove'; claim: UploadClaim }
+  | { type: typeof UPLOAD_QUEUE_MESSAGE_TYPE; action: 'checkpoint-set'; claim: UploadClaim; checkpoint: unknown }
   | { type: typeof UPLOAD_QUEUE_MESSAGE_TYPE; action: 'status'; draftId: string };
 
 function parseRequest(value: unknown): UploadQueueRequest | undefined {
@@ -255,13 +299,15 @@ function parseRequest(value: unknown): UploadQueueRequest | undefined {
       ? value as unknown as UploadQueueRequest
       : undefined;
   }
-  if (!['renew', 'complete', 'fail'].includes(value.action) || !isRecord(value.claim)) return undefined;
+  if (!['renew', 'complete', 'fail', 'checkpoint-get', 'checkpoint-set', 'checkpoint-remove'].includes(value.action)
+    || !isRecord(value.claim)) return undefined;
   const claim = value.claim;
   if (typeof claim.draftId !== 'string'
     || !claim.draftId.trim()
     || typeof claim.token !== 'string'
     || !claim.token
     || !Number.isFinite(claim.leaseExpiresAt)) return undefined;
+  if (value.action === 'checkpoint-set' && !Object.prototype.hasOwnProperty.call(value, 'checkpoint')) return undefined;
   return value as unknown as UploadQueueRequest;
 }
 
@@ -294,6 +340,15 @@ export function registerUploadQueueBackgroundHandlers(queue = getBackgroundUploa
         break;
       case 'fail':
         operation = queue.fail(owner, request.claim);
+        break;
+      case 'checkpoint-get':
+        operation = queue.getCheckpoint(owner, request.claim);
+        break;
+      case 'checkpoint-set':
+        operation = queue.setCheckpoint(owner, request.claim, request.checkpoint);
+        break;
+      case 'checkpoint-remove':
+        operation = queue.removeCheckpoint(owner, request.claim);
         break;
       case 'status':
         operation = queue.status(request.draftId);
@@ -344,6 +399,22 @@ export function createUploadQueueClient(): UploadQueueClient {
       type: UPLOAD_QUEUE_MESSAGE_TYPE,
       action: 'status',
       draftId,
+    }),
+    getCheckpoint: (claim) => sendQueueRequest<unknown>({
+      type: UPLOAD_QUEUE_MESSAGE_TYPE,
+      action: 'checkpoint-get',
+      claim,
+    }),
+    setCheckpoint: (claim, checkpoint) => sendQueueRequest<void>({
+      type: UPLOAD_QUEUE_MESSAGE_TYPE,
+      action: 'checkpoint-set',
+      claim,
+      checkpoint,
+    }),
+    removeCheckpoint: (claim) => sendQueueRequest<void>({
+      type: UPLOAD_QUEUE_MESSAGE_TYPE,
+      action: 'checkpoint-remove',
+      claim,
     }),
   };
 }

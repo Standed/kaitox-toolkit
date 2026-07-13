@@ -419,8 +419,10 @@ export function createQueryIdRefreshingFetch(
   fetchImpl: FetchLike,
   queryIds: ArticleQueryIds,
   refresh: () => Promise<ArticleQueryIds>,
+  beforeMutation?: () => Promise<void>,
 ): FetchLike {
   return async (input, init) => {
+    if ((init?.method ?? 'GET').toUpperCase() !== 'GET') await beforeMutation?.();
     const response = (await fetchImpl(input, init)) as RefreshableResponse;
     const operation = operationFromGraphqlUrl(input);
     if (!operation || !(await isStaleOperationResponse(response))) return response;
@@ -428,6 +430,7 @@ export function createQueryIdRefreshingFetch(
     const refreshedIds = await refresh();
     Object.assign(queryIds, refreshedIds);
     const retry = replaceQueryIdInRequest(input, init, operation, refreshedIds[operation]);
+    if ((retry.init?.method ?? 'GET').toUpperCase() !== 'GET') await beforeMutation?.();
     return fetchImpl(retry.url, retry.init);
   };
 }
