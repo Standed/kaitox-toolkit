@@ -2,6 +2,7 @@
  * 仅在 Articles 列表页的标题行注入 kaitox 按钮，并在 SPA 重绘后保活。 */
 import { Panel } from './panel.js';
 import { toggleSettingsPanel } from './settings-panel.js';
+import { runAutoUploadFromQueue } from './auto-upload.js';
 
 // esbuild define 注入的构建时间戳。页面控制台可看到当前生效的构建版本；
 // 若与最近一次 npm run build:extension 的时间不符，说明插件/页面没重新加载。
@@ -77,6 +78,9 @@ chrome.runtime.onMessage.addListener((msg: any) => {
 });
 
 void watchSettings();
+void runAutoUploadFromQueue().catch((error) => {
+  console.error('[kaitox] 自动上传失败：', error);
+});
 patchHistory(ensurePanel);
 new MutationObserver(scheduleEnsure).observe(document.body, { childList: true, subtree: true });
 setInterval(ensurePanel, 3000);

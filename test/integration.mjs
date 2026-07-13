@@ -112,6 +112,23 @@ const {
   handleContentOsRuntimeMessage,
 } = await import(contentOsBackgroundModuleUrl);
 
+const autoUploadBuild = await buildTestModule({
+  entryPoints: [join(process.cwd(), 'apps/extension/src/auto-upload.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  write: false,
+  logLevel: 'silent',
+});
+const autoUploadModuleUrl = `data:text/javascript;base64,${Buffer.from(autoUploadBuild.outputFiles[0].contents).toString('base64')}`;
+const {
+  assertActiveTargetHandle,
+  readActiveHandleFromHref,
+  runAutoUploadFromQueue,
+  takeAutoUploadDraftId,
+  uploadQueuedDraft,
+} = await import(autoUploadModuleUrl);
+
 const compatibilityFixture = JSON.parse(await readFile(
   new URL('./fixtures/content-os-kaitox-v1.json', import.meta.url),
   'utf8',
@@ -797,6 +814,200 @@ check('failed relay status exposes only a fixed public error code/message',
   failedStatus.error.code === 'DRAFT_FAILED' &&
   !JSON.stringify(failedStatus).includes('/Users/person') &&
   !JSON.stringify(failedStatus).includes('token=abc'));
+
+// ---- -0.25. Task 7 account guard + strict automatic upload ----
+console.log('\n[-0.25] Task 7 account guard + strict automatic upload');
+check('active account parser accepts the exact profile path',
+  readActiveHandleFromHref('/aaxiaoshi666') === 'aaxiaoshi666');
+check('active account parser rejects non-profile routes',
+  readActiveHandleFromHref('/home') === undefined &&
+  readActiveHandleFromHref('/compose/articles') === undefined);
+
+const makeAutoUploadDraft = (overrides = {}) => ({
+  schemaVersion: 1,
+  id: 'task-7-draft',
+  kind: 'x-article',
+  title: 'Task 7 strict draft',
+  markdown: '# Task 7\n\nBody',
+  mode: 'rich',
+  assets: [],
+  createdAt: '2026-07-13T00:00:00.000Z',
+  source: 'content-os',
+  sourceMeta: {
+    handoffId: 'task-7-handoff',
+    targetHandle: '@aaxiaoshi666',
+  },
+  status: 'pending',
+  ...overrides,
+});
+
+const memoryResultStore = () => {
+  const values = new Map();
+  return {
+    values,
+    async get(id) { return values.get(id); },
+    async set(id, result) { values.set(id, result); },
+    async remove(id) { values.delete(id); },
+  };
+};
+
+const makeAutoUploadDeps = ({
+  draft = makeAutoUploadDraft(),
+  activeHref = '/aaxiaoshi666',
+  uploadResult = { restId: 'REST_TASK_7', skippedImages: [] },
+  failDoneAck = false,
+  resultStore = memoryResultStore(),
+} = {}) => {
+  const acks = [];
+  const uploadCalls = [];
+  let doneAckFailures = failDoneAck ? 1 : 0;
+  const client = {
+    async getDraft() { return { ...draft, sourceMeta: { ...draft.sourceMeta } }; },
+    async getAsset() { return new Uint8Array(); },
+    async ack(_id, patch) {
+      acks.push(patch);
+      if (patch.status === 'done' && doneAckFailures-- > 0) {
+        throw new Error('simulated relay done ack failure');
+      }
+      draft.status = patch.status;
+      if (patch.status === 'done') Object.assign(draft, patch);
+      if (patch.status === 'failed') draft.error = patch.error;
+    },
+  };
+  return {
+    deps: {
+      client,
+      resultStore,
+      assertTargetHandle: (bundle) => assertActiveTargetHandle(bundle, {
+        timeoutMs: 0,
+        readProfileHref: () => activeHref,
+      }),
+      uploadDraft: async (...args) => {
+        uploadCalls.push(args);
+        return uploadResult;
+      },
+    },
+    acks,
+    draft,
+    resultStore,
+    uploadCalls,
+  };
+};
+
+const wrongAccount = makeAutoUploadDeps({ activeHref: '/other' });
+await assert.rejects(
+  () => uploadQueuedDraft(wrongAccount.draft.id, wrongAccount.deps),
+  /当前 X 账号/,
+);
+check('wrong active account acks failed and performs no X upload',
+  wrongAccount.uploadCalls.length === 0 &&
+  wrongAccount.acks.at(-1)?.status === 'failed');
+
+const wrongDeclaredTarget = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({ sourceMeta: { handoffId: 'task-7-handoff', targetHandle: '@other' } }),
+});
+await assert.rejects(
+  () => uploadQueuedDraft(wrongDeclaredTarget.draft.id, wrongDeclaredTarget.deps),
+  /目标账号/,
+);
+check('wrong bundle target performs no X upload', wrongDeclaredTarget.uploadCalls.length === 0);
+
+const noRestId = makeAutoUploadDeps({ uploadResult: { skippedImages: [] } });
+await assert.rejects(
+  () => uploadQueuedDraft(noRestId.draft.id, noRestId.deps),
+  /rest_id/,
+);
+check('missing rest_id never acks done',
+  noRestId.acks.every((patch) => patch.status !== 'done') &&
+  noRestId.acks.at(-1)?.status === 'failed');
+
+const skippedImage = makeAutoUploadDeps({
+  uploadResult: { restId: 'REST_INCOMPLETE', skippedImages: ['missing.png'] },
+});
+await assert.rejects(
+  () => uploadQueuedDraft(skippedImage.draft.id, skippedImage.deps),
+  /不完整/,
+);
+check('skipped images never ack done', skippedImage.acks.every((patch) => patch.status !== 'done'));
+
+const strictSuccess = makeAutoUploadDeps();
+const strictResult = await uploadQueuedDraft(strictSuccess.draft.id, strictSuccess.deps);
+check('strict upload returns and acks the exact edit URL',
+  strictResult.restId === 'REST_TASK_7' &&
+  strictResult.editUrl === 'https://x.com/compose/articles/edit/REST_TASK_7' &&
+  JSON.stringify(strictSuccess.acks.at(-1)) === JSON.stringify({
+    status: 'done',
+    targetHandle: '@aaxiaoshi666',
+    restId: 'REST_TASK_7',
+    editUrl: 'https://x.com/compose/articles/edit/REST_TASK_7',
+  }));
+await uploadQueuedDraft(strictSuccess.draft.id, strictSuccess.deps);
+check('replaying a completed draft is idempotent and does not upload twice',
+  strictSuccess.uploadCalls.length === 1);
+
+const recoverable = makeAutoUploadDeps({ failDoneAck: true });
+await assert.rejects(
+  () => uploadQueuedDraft(recoverable.draft.id, recoverable.deps),
+  /simulated relay done ack failure/,
+);
+check('a relay ack interruption preserves the verified result checkpoint',
+  recoverable.resultStore.values.get(recoverable.draft.id)?.restId === 'REST_TASK_7');
+const recoveredUploadResult = await uploadQueuedDraft(recoverable.draft.id, recoverable.deps);
+check('retry recovers the terminal ack without creating a duplicate X draft',
+  recoveredUploadResult.restId === 'REST_TASK_7' &&
+  recoverable.uploadCalls.length === 1 &&
+  recoverable.resultStore.values.has(recoverable.draft.id) === false);
+
+const queuedStorage = makeStorage();
+queuedStorage.values.kaitoxAutoUploadDraftId = 'queued-task-7';
+const [takenFirst, takenSecond] = await Promise.all([
+  takeAutoUploadDraftId(queuedStorage),
+  takeAutoUploadDraftId(queuedStorage),
+]);
+check('queued Content OS draft id is atomically consumed once',
+  [takenFirst, takenSecond].filter(Boolean).length === 1 &&
+  queuedStorage.values.kaitoxAutoUploadDraftId === undefined);
+
+const autoRunStorage = makeStorage();
+autoRunStorage.values.kaitoxAutoUploadDraftId = 'task-7-auto-run';
+const autoRun = makeAutoUploadDeps({ draft: makeAutoUploadDraft({ id: 'task-7-auto-run' }) });
+const { client: autoRunClient, ...autoRunUploadDeps } = autoRun.deps;
+const autoNavigations = [];
+const autoRunResult = await runAutoUploadFromQueue({
+  pathname: '/compose/articles',
+  storage: autoRunStorage,
+  getClient: async () => autoRunClient,
+  uploadDeps: autoRunUploadDeps,
+  navigate: (url) => autoNavigations.push(url),
+});
+check('content auto-upload navigates only to the verified exact edit URL',
+  autoRunResult?.restId === 'REST_TASK_7' &&
+  JSON.stringify(autoNavigations) === JSON.stringify([
+    'https://x.com/compose/articles/edit/REST_TASK_7',
+  ]));
+
+const failedAutoRunStorage = makeStorage();
+failedAutoRunStorage.values.kaitoxAutoUploadDraftId = 'task-7-auto-fail';
+const failedAutoRun = makeAutoUploadDeps({
+  draft: makeAutoUploadDraft({ id: 'task-7-auto-fail' }),
+  activeHref: '/other',
+});
+const { client: failedAutoClient, ...failedAutoUploadDeps } = failedAutoRun.deps;
+const failedNavigations = [];
+await assert.rejects(
+  () => runAutoUploadFromQueue({
+    pathname: '/compose/articles',
+    storage: failedAutoRunStorage,
+    getClient: async () => failedAutoClient,
+    uploadDeps: failedAutoUploadDeps,
+    navigate: (url) => failedNavigations.push(url),
+  }),
+  /当前 X 账号/,
+);
+check('failed content auto-upload leaves a retryable failed relay task and never navigates',
+  failedAutoRun.draft.status === 'failed' &&
+  failedAutoRunStorage.values.kaitoxAutoUploadDraftId === undefined &&
+  failedNavigations.length === 0);
 
 // ---- 0. X 前端 queryId 动态发现 ----
 console.log('\n[0] X 前端 queryId 发现 + 缓存 + 单次刷新');

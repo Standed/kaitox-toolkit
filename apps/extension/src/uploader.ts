@@ -11,7 +11,7 @@
  */
 import { publishXArticle, extractMermaidBlocks } from '@kaitox/x-article';
 import type { ImageFetcher, CoverFetcher } from '@kaitox/x-article';
-import type { DraftBundle, HttpRelayClient } from '@kaitox/relay-protocol';
+import type { DraftBundle, RelayClient } from '@kaitox/relay-protocol';
 import { createQueryIdRefreshingFetch } from './query-id-discovery.js';
 import { readCt0, getArticleQueryIds, refreshArticleQueryIds } from './xsession.js';
 import { renderMermaidPng } from './mermaid-render.js';
@@ -21,9 +21,11 @@ export interface UploadResult {
   skippedImages: string[];
 }
 
+export type DraftAssetReader = Pick<RelayClient, 'getAsset'>;
+
 export async function uploadDraft(
   draft: DraftBundle,
-  client: HttpRelayClient,
+  client: DraftAssetReader,
   onProgress?: (message: string) => void,
 ): Promise<UploadResult> {
   const ct0 = readCt0();

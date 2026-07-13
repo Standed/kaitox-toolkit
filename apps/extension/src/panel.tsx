@@ -11,8 +11,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } f
 import { createPortal } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import type { DraftListItem, DraftStatus, HttpRelayClient, StyleReport } from '@kaitox/relay-protocol';
-import { getRelayClient, getSettings, readTargetHandle } from './xsession.js';
-import { uploadDraft } from './uploader.js';
+import { getRelayClient, getSettings } from './xsession.js';
+import { uploadQueuedDraft } from './auto-upload.js';
 import { LOGO_SVG } from './logo.js';
 import {
   CheckIcon,
@@ -283,7 +283,7 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
   const selected = items.find((d) => d.id === selectedId) ?? null;
   const actionableCount = conn === 'ok' ? items.filter((d) => d.status !== 'done').length : 0;
 
-  /** 上传流程与旧版完全一致：ack(uploading) → getDraft → uploadDraft → ack(done) → 跳编辑页。 */
+  /** Account-guarded strict upload; only a verified done ack may navigate to the editor. */
   const doUpload = useCallback(
     async (id: string) => {
       const client = clientRef.current;
@@ -293,24 +293,19 @@ function PanelApp({ btnHost }: { btnHost: HTMLElement }) {
       setTab('uploading');
       setPage(1);
       try {
-        const targetHandle = readTargetHandle();
-        if (!targetHandle) throw new Error('无法确认当前登录的 X 账号，请刷新页面后重试。');
-        await client.ack(id, { status: 'uploading' });
-        const bundle = await client.getDraft(id);
-        bundles.seed(bundle);
-        const result = await uploadDraft(bundle, client, (message) => {
-          setUploads((u) => ({ ...u, [id]: { phase: 'uploading', message } }));
+        const result = await uploadQueuedDraft(id, {
+          client,
+          onProgress: (message) => {
+            setUploads((u) => ({ ...u, [id]: { phase: 'uploading', message } }));
+          },
         });
-        if (!result.restId) throw new Error('草稿已创建，但未取到 rest_id，未写入成功状态。');
-        const editUrl = `https://x.com/compose/articles/edit/${result.restId}`;
-        await client.ack(id, { status: 'done', targetHandle, restId: result.restId, editUrl });
-
-        const skipped = result.skippedImages.length ? `（跳过 ${result.skippedImages.length} 张图）` : '';
-        setUploads((u) => ({ ...u, [id]: { phase: 'success', message: `已创建草稿${skipped}，正在打开…` } }));
-        setTimeout(() => location.assign(editUrl), 600);
+        setUploads((u) => ({
+          ...u,
+          [id]: { phase: 'success', message: `已创建草稿：${result.editUrl}` },
+        }));
+        setTimeout(() => location.assign(result.editUrl), 600);
       } catch (err: any) {
         const msg = err?.message ?? String(err);
-        await client.ack(id, { status: 'failed', error: msg }).catch(() => {});
         setUploads((u) => ({ ...u, [id]: { phase: 'error', message: `上传失败：${msg}` } }));
         void refresh();
       }
