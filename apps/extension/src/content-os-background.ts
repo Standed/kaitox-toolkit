@@ -42,12 +42,15 @@ export interface ContentOsBackgroundDependencies {
   tabs: TabCreator;
 }
 
+type HandoffReplayStage = 'relay-enqueued' | 'tab-opened';
+
 interface StoredHandoffRecord {
-  version: 1;
+  version: 2;
   handoffId: string;
   fingerprint: string;
   draftId: string;
   targetHandle: typeof CONTENT_OS_TARGET_HANDLE;
+  stage: HandoffReplayStage;
 }
 
 const activeHandoffs = new Map<string, {
@@ -62,11 +65,15 @@ function handoffRecordKey(handoffId: string): string {
 function readStoredHandoffRecord(value: unknown): StoredHandoffRecord | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  if (record.version !== 1
+  if ((record.version !== 1 && record.version !== 2)
     || typeof record.handoffId !== 'string'
     || typeof record.fingerprint !== 'string'
     || typeof record.draftId !== 'string'
     || record.targetHandle !== CONTENT_OS_TARGET_HANDLE) return undefined;
+  if (record.version === 1) {
+    return { ...record, version: 2, stage: 'tab-opened' } as unknown as StoredHandoffRecord;
+  }
+  if (record.stage !== 'relay-enqueued' && record.stage !== 'tab-opened') return undefined;
   return record as unknown as StoredHandoffRecord;
 }
 
@@ -226,6 +233,17 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+async function openXArticlesTab(
+  storageKey: string,
+  record: StoredHandoffRecord,
+  dependencies: ContentOsBackgroundDependencies,
+): Promise<void> {
+  await dependencies.tabs.create({ url: X_ARTICLES_URL });
+  await dependencies.storageLocal.set({
+    [storageKey]: { ...record, stage: 'tab-opened' satisfies HandoffReplayStage },
+  });
+}
+
 async function enqueueValidatedHandoff(
   manifest: XArticleHandoffManifest,
   fingerprint: string,
@@ -238,6 +256,9 @@ async function enqueueValidatedHandoff(
     if (!stored || stored.handoffId !== manifest.handoffId || stored.fingerprint !== fingerprint) {
       throw new ContentOsBridgeError('HANDOFF_REPLAY_CONFLICT');
     }
+    if (stored.stage === 'relay-enqueued') {
+      await openXArticlesTab(storageKey, stored, dependencies);
+    }
     return { draftId: stored.draftId };
   }
   const downloadList = manifest.cover ? [...manifest.assets, manifest.cover] : manifest.assets;
@@ -248,12 +269,12 @@ async function enqueueValidatedHandoff(
   );
   const bodyBytes = downloaded.slice(0, manifest.assets.length);
   const coverBytes = manifest.cover ? downloaded[manifest.assets.length] : undefined;
-  if (!validateHandoff(manifest, { now: dependencies.now }).ok) {
-    throw new ContentOsBridgeError('INVALID_HANDOFF');
-  }
   let draftId: string;
   try {
     const client = await dependencies.getClient();
+    if (!validateHandoff(manifest, { now: dependencies.now }).ok) {
+      throw new ContentOsBridgeError('INVALID_HANDOFF');
+    }
     ({ id: draftId } = await client.postDraft({
       title: manifest.title,
       markdown: manifest.markdown,
@@ -290,17 +311,18 @@ async function enqueueValidatedHandoff(
   }
 
   const record: StoredHandoffRecord = {
-    version: 1,
+    version: 2,
     handoffId: manifest.handoffId,
     fingerprint,
     draftId,
     targetHandle: CONTENT_OS_TARGET_HANDLE,
+    stage: 'relay-enqueued',
   };
   await dependencies.storageLocal.set({
     [storageKey]: record,
     kaitoxAutoUploadDraftId: draftId,
   });
-  await dependencies.tabs.create({ url: X_ARTICLES_URL });
+  await openXArticlesTab(storageKey, record, dependencies);
   return { draftId };
 }
 

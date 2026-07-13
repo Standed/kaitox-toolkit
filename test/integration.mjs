@@ -548,6 +548,65 @@ await assert.rejects(
 );
 check('expiry is rechecked immediately before relay post', expiredPostCount === 0);
 
+let clientExpiryNow = handoffNow;
+let clientExpiryPostCount = 0;
+await assert.rejects(
+  () => enqueueContentOsHandoff({
+    ...backgroundManifest,
+    handoffId: 'handoff-expires-during-client-setup',
+    expiresAt: new Date(handoffNow + 10).toISOString(),
+  }, {
+    ...backgroundDeps,
+    now: () => clientExpiryNow,
+    storageLocal: { values: {}, async get() { return {}; }, async set() {} },
+    getClient: async () => {
+      clientExpiryNow += 20;
+      return {
+        async postDraft() { clientExpiryPostCount++; return { id: 'must-not-exist' }; },
+      };
+    },
+  }),
+  (error) => error?.code === 'INVALID_HANDOFF',
+);
+check('expiry is rechecked after client setup immediately before relay post', clientExpiryPostCount === 0);
+
+let tabRetryPostCount = 0;
+let tabRetryFetchCount = 0;
+let tabRetryOpenAttempts = 0;
+const tabRetryStorage = {
+  values: {},
+  async get(key) { return { [key]: this.values[key] }; },
+  async set(value) { Object.assign(this.values, value); },
+};
+const tabRetryManifest = { ...backgroundManifest, handoffId: 'handoff-tab-retry' };
+const tabRetryDeps = {
+  ...backgroundDeps,
+  storageLocal: tabRetryStorage,
+  fetchImpl: async (...args) => {
+    tabRetryFetchCount++;
+    return backgroundDeps.fetchImpl(...args);
+  },
+  getClient: async () => ({
+    async postDraft() { tabRetryPostCount++; return { id: 'draft-tab-retry' }; },
+  }),
+  tabs: {
+    async create() {
+      tabRetryOpenAttempts++;
+      if (tabRetryOpenAttempts === 1) throw new Error('simulated tab open failure');
+    },
+  },
+};
+await assert.rejects(
+  () => enqueueContentOsHandoff(tabRetryManifest, tabRetryDeps),
+  /simulated tab open failure/,
+);
+const tabRetryResult = await enqueueContentOsHandoff(tabRetryManifest, tabRetryDeps);
+check('a tab-open failure replays only the tab-opening stage',
+  tabRetryResult.draftId === 'draft-tab-retry'
+  && tabRetryPostCount === 1
+  && tabRetryFetchCount === 5
+  && tabRetryOpenAttempts === 2);
+
 const safeStatus = await contentOsDraftStatus('draft-content-os-1', validHandoff.handoffId, backgroundDeps);
 check('status response is strict and omits body/account/credential-adjacent fields',
   JSON.stringify(safeStatus) === JSON.stringify({
