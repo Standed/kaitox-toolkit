@@ -23,7 +23,8 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { createReadStream } from 'node:fs';
-import { writeFile, rm, mkdir } from 'node:fs/promises';
+import { writeFile, readFile, rm, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { DraftBundle } from '@kaitox/relay-protocol';
 import {
   isValidKindSegment,
@@ -128,6 +129,46 @@ function settingView(state: RelayState): { port: number; version: string; tokenC
   return { port: relayPort(), version: RELAY_VERSION, tokenConfigured: Boolean(state.token) };
 }
 
+type ArticleMediaProbe = {
+  version: 1;
+  observedAt: string;
+  mediaItems: Array<{ mediaCategory: string; fields: string[] }>;
+};
+
+function validateArticleMediaProbe(value: unknown): ArticleMediaProbe | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  if (input.version !== 1 || typeof input.observedAt !== 'string' || !Array.isArray(input.mediaItems)) return null;
+  if (input.mediaItems.length < 1 || input.mediaItems.length > 16) return null;
+  const mediaItems: ArticleMediaProbe['mediaItems'] = [];
+  for (const item of input.mediaItems) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    if (typeof record.mediaCategory !== 'string' || record.mediaCategory.length < 1 || record.mediaCategory.length > 80) return null;
+    if (!Array.isArray(record.fields) || record.fields.length > 16 || record.fields.some((field) => typeof field !== 'string' || field.length > 80)) return null;
+    mediaItems.push({ mediaCategory: record.mediaCategory, fields: [...record.fields] });
+  }
+  return { version: 1, observedAt: input.observedAt, mediaItems };
+}
+
+function articleMediaProbePath() {
+  return join(kaitoxHome(), 'x-article', 'probes', 'article-media.json');
+}
+
+async function saveArticleMediaProbe(probe: ArticleMediaProbe) {
+  const file = articleMediaProbePath();
+  await mkdir(join(kaitoxHome(), 'x-article', 'probes'), { recursive: true });
+  await writeFile(file, JSON.stringify(probe, null, 2) + '\n', 'utf8');
+}
+
+async function getArticleMediaProbe(): Promise<ArticleMediaProbe | null> {
+  try {
+    return validateArticleMediaProbe(JSON.parse(await readFile(articleMediaProbePath(), 'utf8')));
+  } catch {
+    return null;
+  }
+}
+
 /** 按 id 取某个 kind 下的草稿；不存在 / 非法 id 都视作 404。草稿按 kind 命名空间存储，
  *  只在该 kind 的目录里查找，因此跨命名空间天然不可见。 */
 async function getDraftInKind(kind: string, id: string): Promise<DraftBundle | null> {
@@ -186,6 +227,31 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: RelaySta
         await saveConfig({ token: v.value.token });
       }
       sendJson(req, res, 200, settingView(state));
+      return;
+    }
+  }
+
+  // 只读 schema probe：扩展仅提交 X Article 正文里视频媒体的类别和字段名，
+  // 不落文章正文、媒体 ID、cookie 或任何登录信息。
+  if (parts.length === 3 && parts[0] === 'x-article' && parts[1] === 'probes' && parts[2] === 'article-media') {
+    if (method === 'GET') {
+      const probe = await getArticleMediaProbe();
+      if (!probe) {
+        sendJson(req, res, 404, { error: 'article media probe not found' });
+        return;
+      }
+      sendJson(req, res, 200, probe);
+      return;
+    }
+    if (method === 'POST') {
+      const body = await readJsonBody(req);
+      const probe = body.ok ? validateArticleMediaProbe(body.value) : null;
+      if (!probe) {
+        sendJson(req, res, 400, { error: 'invalid article media probe' });
+        return;
+      }
+      await saveArticleMediaProbe(probe);
+      sendJson(req, res, 201, { ok: true });
       return;
     }
   }

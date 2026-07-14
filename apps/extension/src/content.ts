@@ -77,6 +77,13 @@ chrome.runtime.onMessage.addListener((msg: any) => {
   if (msg?.type === 'kaitox-toggle-settings') toggleSettingsPanel();
 });
 
+// 主世界采样器只会给出视频媒体字段名和类别，不包含文章正文、媒体 ID 或登录信息。
+window.addEventListener('kaitox-article-video-schema', (event) => {
+  const detail = (event as CustomEvent).detail;
+  if (!detail || typeof detail !== 'object') return;
+  void chrome.runtime.sendMessage({ type: 'kaitox-article-video-schema', probe: detail });
+});
+
 void watchSettings();
 void runAutoUploadFromQueue().catch((error) => {
   console.error('[kaitox] 自动上传失败：', error);

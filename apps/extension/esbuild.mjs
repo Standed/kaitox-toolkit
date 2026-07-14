@@ -23,6 +23,7 @@ const common = {
 await mkdir('dist', { recursive: true });
 
 await esbuild.build({ ...common, entryPoints: ['src/content.ts'], outfile: 'dist/content.js' });
+await esbuild.build({ ...common, entryPoints: ['src/article-video-probe.ts'], outfile: 'dist/article-video-probe.js' });
 await esbuild.build({ ...common, entryPoints: ['src/content-os-content.ts'], outfile: 'dist/content-os-content.js' });
 await esbuild.build({ ...common, entryPoints: ['src/background.ts'], outfile: 'dist/background.js' });
 // mermaid 单独出 ESM 包，content.js 里动态 import() 懒加载（见 mermaid-render.ts）。

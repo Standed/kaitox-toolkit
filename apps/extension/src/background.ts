@@ -6,6 +6,17 @@ import { registerUploadQueueBackgroundHandlers } from './upload-queue.js';
 registerUploadQueueBackgroundHandlers();
 registerContentOsBackgroundHandlers();
 
+chrome.runtime.onMessage.addListener((message: unknown) => {
+  if (!message || typeof message !== 'object' || (message as { type?: unknown }).type !== 'kaitox-article-video-schema') return;
+  const probe = (message as { probe?: unknown }).probe;
+  // 仅写给本机 relay，供后续按 X 的真实结构实现视频上传；失败不影响用户保存文章。
+  void fetch(`${DEFAULT_RELAY_BASE}/x-article/probes/article-media`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(probe),
+  }).catch(() => {});
+});
+
 // 点工具栏图标：任意页面弹出右侧设置浮窗。
 // 1) 页面里已有脚本（x.com 文章页常驻，或此前注入过）→ 发消息开/关；
 // 2) 没有 → 借 activeTab 现场注入样式和设置脚本（注入即打开）；

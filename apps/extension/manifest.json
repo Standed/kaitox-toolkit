@@ -27,6 +27,15 @@
       "run_at": "document_idle"
     },
     {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": ["article-video-probe.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
       "matches": ["https://aizao.ai/writing*"],
       "js": ["content-os-content.js"],
       "run_at": "document_idle"
