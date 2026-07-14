@@ -1767,6 +1767,37 @@ try {
   });
   check('畸形 PATCH → 400（不再把垃圾 status 写盘）', badPatch.status === 400);
 
+  const legacyPost = await postRaw('/x-article/drafts', JSON.stringify({
+    bundle: {
+      schemaVersion: 1,
+      id: 'legacy-extension-done',
+      kind: 'x-article',
+      title: 'legacy extension compatibility',
+      markdown: 'body',
+      mode: 'rich',
+      assets: [],
+      createdAt: '2026-07-14T00:00:00.000Z',
+      source: 'direct-feishu',
+      sourceMeta: { targetHandle: '@aaxiaoshi666' },
+    },
+    assets: [],
+  }));
+  const legacyDraftId = (await legacyPost.json()).id;
+  const legacyDone = await fetch(`${BASE}/x-article/drafts/${legacyDraftId}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ status: 'done', restId: 'LEGACY_REST_ID' }),
+  });
+  const legacyDoneBody = await legacyDone.json();
+  check(
+    '旧版扩展 done ack 自动补齐锁定账号与严格编辑链接',
+    legacyDone.status === 200
+      && legacyDoneBody.targetHandle === '@aaxiaoshi666'
+      && legacyDoneBody.restId === 'LEGACY_REST_ID'
+      && legacyDoneBody.editUrl === 'https://x.com/compose/articles/edit/LEGACY_REST_ID',
+  );
+  await client.deleteDraft(legacyDraftId);
+
   const setting = await (await fetch(`${BASE}/setting`)).json();
   check('GET /setting 形态（不含 token 值）', setting.port === 8788 && typeof setting.version === 'string' && setting.tokenConfigured === false && !('token' in setting));
   const patchSetting = (body, headers = {}) =>

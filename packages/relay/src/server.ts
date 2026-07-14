@@ -316,7 +316,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: RelaySta
 
     // PATCH /:kind/drafts/:id
     if (method === 'PATCH' && parts.length === 3) {
-      if (!(await getDraftInKind(kind, id))) {
+      const current = await getDraftInKind(kind, id);
+      if (!current) {
         sendJson(req, res, 404, { error: 'not found' });
         return;
       }
@@ -325,7 +326,27 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: RelaySta
         sendJson(req, res, 400, { error: 'invalid JSON body' });
         return;
       }
-      const v = validateAckPatch(body.value);
+      let patchInput = body.value;
+      if (patchInput && typeof patchInput === 'object' && !Array.isArray(patchInput)) {
+        const legacy = patchInput as Record<string, unknown>;
+        const targetHandle = current.sourceMeta?.targetHandle;
+        if (
+          legacy.status === 'done'
+          && typeof legacy.restId === 'string'
+          && legacy.restId.trim()
+          && legacy.targetHandle === undefined
+          && legacy.editUrl === undefined
+          && typeof targetHandle === 'string'
+          && targetHandle.trim()
+        ) {
+          patchInput = {
+            ...legacy,
+            targetHandle,
+            editUrl: `https://x.com/compose/articles/edit/${legacy.restId}`,
+          };
+        }
+      }
+      const v = validateAckPatch(patchInput);
       if (!v.ok) {
         sendJson(req, res, 400, { error: 'invalid status patch', issues: v.issues });
         return;
