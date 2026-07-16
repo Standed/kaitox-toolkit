@@ -312,9 +312,12 @@ function parseRequest(value: unknown): UploadQueueRequest | undefined {
 }
 
 function senderOwner(sender: chrome.runtime.MessageSender): string | undefined {
-  if (sender.tab?.id === undefined || sender.frameId !== 0 || !sender.url) return undefined;
+  const senderUrl = sender.url ?? sender.tab?.url;
+  if (sender.tab?.id === undefined || (sender.frameId !== undefined && sender.frameId !== 0) || !senderUrl) {
+    return undefined;
+  }
   try {
-    const url = new URL(sender.url);
+    const url = new URL(senderUrl);
     if (url.origin !== 'https://x.com' && url.origin !== 'https://twitter.com') return undefined;
     return `${sender.tab.id}:${sender.documentId ?? url.href}`;
   } catch {
