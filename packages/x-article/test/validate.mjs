@@ -7,6 +7,8 @@
 import { markdownToContentState, collectImageSources, parseTweetId } from '../dist/contentState.js';
 import { sanitizeContentState, XArticleClient } from '../dist/xArticleClient.js';
 import { deriveTitle, publishXArticle } from '../dist/publishArticle.js';
+import { checkMarkdownStyle } from '../dist/styleCheck.js';
+import { collectVideoSources, inspectArticleMediaBudget } from '../dist/mediaBudget.js';
 
 // Content OS exports image captions in the paragraph immediately after the image.
 // The converter must preserve that adjacency without adding media-specific fields.
@@ -84,6 +86,12 @@ const ents = contentState.entity_map;
 const byType = (t) => blocks.filter((b) => b.type === t);
 
 check('图片收集正确', JSON.stringify(collectImageSources(md)) === JSON.stringify(['https://cdn.example.com/a.png']));
+
+const mediaBudgetMd = `${Array.from({ length: 25 }, (_, index) => `![图${index}](https://cdn.example.com/${index}.png)`).join('\n')}\n\n<figure><source mime="video/mp4" href="./demo.mp4"></figure>`;
+const mediaBudget = inspectArticleMediaBudget(mediaBudgetMd);
+check('视频源收集正确', JSON.stringify(collectVideoSources(mediaBudgetMd)) === JSON.stringify(['./demo.mp4']));
+check('正文媒体预算计入图片和视频', mediaBudget.total === 26 && mediaBudget.overBy === 1, `(got ${JSON.stringify(mediaBudget)})`);
+check('超媒体上限在上传前报错', checkMarkdownStyle(mediaBudgetMd).issues.some((issue) => issue.rule === 'media-limit' && issue.severity === 'error'));
 
 // CJK 加粗 offset —— 期望值 offset:27 length:19 = "Harness Engineering"
 const first = blocks[0];

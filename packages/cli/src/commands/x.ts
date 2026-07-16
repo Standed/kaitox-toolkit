@@ -68,6 +68,13 @@ async function cmdPush(args: string[]): Promise<void> {
   let built = await buildDraft({ markdownPath: file, titleOverride, mode, coverPath });
   printReport(built.report);
 
+  // 这不是文案风格选择，而是 X Article 的硬限制；--force 也不能越过。
+  if (built.report.issues.some((issue) => issue.rule === 'media-limit' && issue.severity === 'error')) {
+    console.error('正文媒体超出 X Article 上限，未创建草稿。请按提示先合成相邻图片后重试。');
+    process.exitCode = 1;
+    return;
+  }
+
   // 不友好且未显式指定处理方式 → 询问。
   if (!built.report.friendly && !forcePlaintext && !forceRaw) {
     const decision = await promptDecision();

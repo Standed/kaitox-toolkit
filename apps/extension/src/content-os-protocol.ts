@@ -1,4 +1,4 @@
-import { collectImageSources } from '@kaitox/x-article';
+import { collectImageSources, inspectArticleMediaBudget } from '@kaitox/x-article';
 
 export const CONTENT_OS_ORIGIN = 'https://aizao.ai';
 export const CONTENT_OS_OUTBOUND_SOURCE = 'xiyangshi-content-os';
@@ -245,6 +245,13 @@ export function validateHandoff(
     issues.push(`$.targetHandle must equal ${CONTENT_OS_TARGET_HANDLE}`);
   }
   if (value.source !== 'content-os') issues.push('$.source must equal content-os');
+
+  if (typeof value.markdown === 'string') {
+    const mediaBudget = inspectArticleMediaBudget(value.markdown, MAX_HANDOFF_MEDIA);
+    if (mediaBudget.overBy > 0) {
+      issues.push(`$.markdown has ${mediaBudget.total} body media items (images ${mediaBudget.images.length}, videos ${mediaBudget.videos.length}); X Article allows ${MAX_HANDOFF_MEDIA}. Preserve the video and merge at least ${mediaBudget.overBy} adjacent image group(s) first.`);
+    }
+  }
 
   const assets = value.assets;
   if (!Array.isArray(assets) || assets.length < 1 || assets.length > MAX_HANDOFF_MEDIA) {

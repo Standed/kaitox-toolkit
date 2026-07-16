@@ -22,6 +22,12 @@ export {
   parseTweetId,
 } from './contentState.js';
 export {
+  collectVideoSources,
+  inspectArticleMediaBudget,
+  X_ARTICLE_MAX_BODY_MEDIA,
+} from './mediaBudget.js';
+export type { ArticleMediaBudget } from './mediaBudget.js';
+export {
   XArticleClient,
   sanitizeContentState,
   DEFAULT_BEARER_TOKEN,

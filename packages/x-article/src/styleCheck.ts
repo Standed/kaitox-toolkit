@@ -22,6 +22,7 @@
 
 import { marked } from 'marked';
 import { collectImageSources } from './contentState.js';
+import { inspectArticleMediaBudget, X_ARTICLE_MAX_BODY_MEDIA } from './mediaBudget.js';
 import type { StyleIssue, StyleReport } from '@kaitox/relay-protocol';
 
 /** 单张图片的元信息（上传端解析本地/相对路径后填）。key = markdown 里的原样 src。 */
@@ -37,6 +38,8 @@ export interface StyleCheckOptions {
   assetMap?: Record<string, AssetMeta>;
   /** 单图大小上限（字节），默认 5MB。 */
   maxImageBytes?: number;
+  /** X Article 正文媒体实体上限，默认 25。封面不计入。 */
+  maxBodyMedia?: number;
 }
 
 interface LooseToken {
@@ -59,6 +62,7 @@ const AUTO_COMPRESSED_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp'])
 export function checkMarkdownStyle(markdown: string, opts: StyleCheckOptions = {}): StyleReport {
   const issues: StyleIssue[] = [];
   const maxBytes = opts.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+  const maxBodyMedia = opts.maxBodyMedia ?? X_ARTICLE_MAX_BODY_MEDIA;
   const tokens = marked.lexer(markdown) as unknown as LooseToken[];
 
   // 逐个 top-level token 扫描，同时用 raw 长度累加出源码偏移 → 行号。
@@ -223,6 +227,21 @@ export function checkMarkdownStyle(markdown: string, opts: StyleCheckOptions = {
         excerpt: src,
       });
     }
+  }
+
+  // X 将正文图片和内嵌视频一起计数。必须在投递前阻断，避免草稿上传到最后才失败。
+  const mediaBudget = inspectArticleMediaBudget(markdown, maxBodyMedia);
+  if (mediaBudget.overBy > 0) {
+    const hasVideo = mediaBudget.videos.length > 0;
+    issues.push({
+      rule: 'media-limit',
+      severity: 'error',
+      message: `正文媒体共 ${mediaBudget.total} 个（图片 ${mediaBudget.images.length}、视频 ${mediaBudget.videos.length}），超过 X Article 正文 ${maxBodyMedia} 个的上限。`,
+      suggestion: hasVideo
+        ? `若要保留视频，请先把至少 ${mediaBudget.overBy} 组相邻图片合成为高清组图，再重新导出。`
+        : `请把至少 ${mediaBudget.overBy} 组相邻图片合成为高清组图，再重新导出。`,
+      line: firstLineOfSubstring(markdown, mediaBudget.videos[0] ?? mediaBudget.images[0]) ?? 1,
+    });
   }
 
   // 空文档。
